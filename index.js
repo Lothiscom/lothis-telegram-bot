@@ -9,13 +9,13 @@ const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
-// Animated welcome (GIF/MP4). Env override mogelijk, maar default = jouw URL.
+// Geen animatie voor nu
+const WELCOME_ANIMATION_URL = process.env.WELCOME_ANIMATION_URL || "";
+
+// Afbeelding als welcome card
 const WELCOME_IMAGE_URL =
   process.env.WELCOME_IMAGE_URL ||
   "http://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg";
-
-// Optional fallback static image (alleen nodig als je dat zelf wil instellen)
-const WELCOME_IMAGE_URL = process.env.WELCOME_IMAGE_URL || "";
 
 if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_ASSISTANT_ID || !PUBLIC_BASE_URL) {
   console.error(
