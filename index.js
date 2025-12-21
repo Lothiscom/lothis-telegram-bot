@@ -3,14 +3,10 @@ import Database from "better-sqlite3";
 import fetch from "node-fetch";
 
 // ---------- ENV ----------
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN; // set in env, never hardcode
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
-
-// Your public HTTPS URL (where Telegram can reach your server), e.g. https://bot.lothis.com
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
-
-// optional: set a secret path segment to avoid random hits
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
 if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_ASSISTANT_ID || !PUBLIC_BASE_URL) {
@@ -25,17 +21,17 @@ app.use(express.json({ limit: "1mb" }));
 const db = new Database("lothis.sqlite");
 db.exec(`
   CREATE TABLE IF NOT EXISTS threads (
-    chat_id TEXT PRIMARY KEY,
+    chat_id   TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL,
-    language TEXT,
+    language  TEXT,
     updated_at INTEGER NOT NULL
   );
 `);
 
-const getThread = db.prepare("SELECT thread_id FROM threads WHERE chat_id = ?");
+const getThread = db.prepare("SELECT thread_id, language FROM threads WHERE chat_id = ?");
 const upsertThread = db.prepare(`
-  INSERT INTO threads(chat_id, thread_id, language, updated_at)
-  VALUES(?, ?, COALESCE((SELECT language FROM threads WHERE chat_id = ?), NULL), ?)
+  INSERT INTO threads (chat_id, thread_id, language, updated_at)
+  VALUES (?, ?, NULL, ?)
   ON CONFLICT(chat_id) DO UPDATE SET
     thread_id = excluded.thread_id,
     updated_at = excluded.updated_at
@@ -97,7 +93,6 @@ async function openaiAddUserMessage(threadId, content) {
 }
 
 async function openaiRun(threadId, lang) {
-  // optioneel: je kunt language ook meegeven als instructions
   const body = lang
     ? {
         assistant_id: OPENAI_ASSISTANT_ID,
@@ -161,8 +156,7 @@ async function lothisReply(chatId, userText) {
 
   if (!threadId) {
     threadId = await openaiCreateThread();
-    // language laten we hier ongemoeid; wordt apart gezet
-    upsertThread.run(String(chatId), threadId, String(chatId), Date.now());
+    upsertThread.run(String(chatId), threadId, Date.now());
   }
 
   const lang = getLanguage.get(String(chatId))?.language;
@@ -187,7 +181,6 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
   try {
     const update = req.body;
-
     const message = update.message || update.edited_message;
     if (!message) return;
 
@@ -196,16 +189,29 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
     if (!chatId) return;
 
-    // ----- /start: toon taalkeuze -----
+    // ----- /start: taalkeuze OF terugkomen in bestaande taal -----
     if (text === "/start") {
-      await tgSendMessage(chatId, "Choose your language:\nKies je taal:");
+      const existingLang = getLanguage.get(String(chatId))?.language;
 
+      if (existingLang) {
+        const msg =
+          existingLang === "nl"
+            ? "We praten al Nederlands 😊 Vertel me gewoon wat er nu in je hoofd zit."
+            : existingLang === "en"
+            ? "We're already chatting in English 🙂 Just tell me what's on your mind."
+            : "Wir sprechen schon Deutsch 🙂 Erzähl mir einfach, was dich gerade beschäftigt.";
+
+        await tgSendMessage(chatId, msg);
+        return;
+      }
+
+      // Nog geen taal gekozen → toon keyboard
       await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
-          text: "Language:",
+          text: "Choose your language / Kies je taal:",
           reply_markup: {
             keyboard: [
               [{ text: "🇳🇱 Nederlands" }],
@@ -234,29 +240,41 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
       let row = getThread.get(String(chatId));
       if (!row) {
         const newThread = await openaiCreateThread();
-        upsertThread.run(String(chatId), newThread, String(chatId), Date.now());
+        upsertThread.run(String(chatId), newThread, Date.now());
       }
 
       setLanguage.run(langCode, String(chatId));
 
       const confirmText =
         langCode === "nl"
-          ? "Top! We praten Nederlands."
+          ? "Top, we praten Nederlands. Waar zit je hoofd nu het meeste mee?"
           : langCode === "en"
-          ? "Great! We'll talk in English."
-          : "Super! Wir sprechen jetzt Deutsch.";
+          ? "Nice, we’ll talk in English. What’s on your mind right now?"
+          : "Super, wir sprechen Deutsch. Woran denkst du gerade am meisten?";
 
-      await tgSendMessage(chatId, confirmText);
+      // stuur message + verwijder het taal-keyboard
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: confirmText,
+          reply_markup: {
+            remove_keyboard: true
+          }
+        })
+      });
+
       return;
     }
 
-    // geen text (voice, foto, etc.)
+    // Geen text (voice, foto, etc.)
     if (!text) {
       await tgSendMessage(chatId, "Stuur me even in tekst wat je bedoelt, dan pak ik ’m meteen.");
       return;
     }
 
-    // normale message → naar Lothis
+    // Normale message → naar Lothis
     const reply = await lothisReply(chatId, text);
     await tgSendMessage(chatId, reply);
   } catch (e) {
