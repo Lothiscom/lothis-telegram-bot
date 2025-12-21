@@ -9,7 +9,7 @@ const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
-// We gebruiken nu géén animatie, alleen een static image welkomstcard
+// Animatie gebruiken we nu niet (maar houden de var zodat je later makkelijk kunt omschakelen)
 const WELCOME_ANIMATION_URL = process.env.WELCOME_ANIMATION_URL || "";
 
 // Static welcome image (jouw lotus-afbeelding als default)
@@ -258,12 +258,18 @@ async function sendLanguageKeyboard(chatId) {
   }
 }
 
-// ✨ Language-Cycling Intro (5 grootste talen incl. NL)
+// ✨ Language-Cycling Intro (5 talen met welkomstzinnen)
 async function languageCyclingIntro(chatId) {
   const urlSend = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
   const urlEdit = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`;
 
-  const languages = ["English", "Español", "العربية", "中文", "Nederlands"];
+  const lines = [
+    "Welcome at Lothis _",
+    "Bienvenido a Lothis _",
+    "مرحبًا بك في لوثيس _",
+    "欢迎来到 Lothis _",
+    "Welkom bij Lothis _"
+  ];
 
   // Eerste message
   const firstRes = await fetch(urlSend, {
@@ -271,14 +277,13 @@ async function languageCyclingIntro(chatId) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
-      text: languages[0]
+      text: lines[0]
     })
   });
 
   if (!firstRes.ok) {
     const t = await firstRes.text().catch(() => "");
     console.error("languageCyclingIntro sendMessage failed:", firstRes.status, t);
-    // fallback: direct naar language keyboard
     await sendLanguageKeyboard(chatId);
     return;
   }
@@ -290,33 +295,33 @@ async function languageCyclingIntro(chatId) {
     return;
   }
 
-  // Cyclen door de talen
-  for (let i = 1; i < languages.length; i++) {
-    await new Promise((r) => setTimeout(r, 700));
+  // Wissel de talen 1 voor 1
+  for (let i = 1; i < lines.length; i++) {
+    await new Promise((r) => setTimeout(r, 800));
     await fetch(urlEdit, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
         message_id: messageId,
-        text: languages[i]
+        text: lines[i]
       })
     }).catch(() => {});
   }
 
-  // Laatste fade naar neutrale tekst
-  await new Promise((r) => setTimeout(r, 800));
+  // Finale tekst
+  await new Promise((r) => setTimeout(r, 900));
   await fetch(urlEdit, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
       message_id: messageId,
-      text: "Choose your language / Kies je taal:"
+      text: "👉 Choose your language / Kies je taal:"
     })
   }).catch(() => {});
 
-  // En daarna het echte taal-keuze keyboard laten zien
+  // Laat het keyboard zien
   await sendLanguageKeyboard(chatId);
 }
 
@@ -355,7 +360,6 @@ async function sendWelcomeCard(chatId) {
     ]
   ];
 
-  // (Eventueel animatie later, nu altijd static image)
   await tgSendPhotoWithButtons(chatId, caption, inlineKeyboard);
 }
 
@@ -428,7 +432,7 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
     if (!chatId) return;
 
-    // ----- /start: Language-Cycling Intro voor nieuwe users -----
+    // ----- /start: Language-Cycling Intro voor nieuwe users, anders direct welcome card -----
     if (text === "/start") {
       let row = getThread.get(String(chatId));
       if (!row?.thread_id) {
@@ -440,10 +444,8 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
       const existingLang = row?.language || getLanguage.get(String(chatId))?.language || null;
 
       if (existingLang) {
-        // Als we de taal al kennen → direct welcome card in die taal
         await sendWelcomeCard(chatId);
       } else {
-        // Nog geen taal → Language-Cycling Intro
         await languageCyclingIntro(chatId);
       }
 
