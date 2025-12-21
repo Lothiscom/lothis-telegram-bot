@@ -9,10 +9,10 @@ const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
-// Geen animatie voor nu
+// We gebruiken nu géén animatie, alleen een static image welkomstcard
 const WELCOME_ANIMATION_URL = process.env.WELCOME_ANIMATION_URL || "";
 
-// Afbeelding als welcome card
+// Static welcome image (jouw lotus-afbeelding als default)
 const WELCOME_IMAGE_URL =
   process.env.WELCOME_IMAGE_URL ||
   "http://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg";
@@ -76,10 +76,10 @@ async function tgSendMessage(chatId, text) {
   }
 }
 
-// Static image fallback (we gebruiken dit alleen als animatie er niet is)
+// Static image welkomstcard (met inline buttons)
 async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
   if (!WELCOME_IMAGE_URL) {
-    // geen image ingesteld → val terug op tekst
+    // fallback naar tekst-only
     const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
     const res = await fetch(url, {
       method: "POST",
@@ -258,6 +258,68 @@ async function sendLanguageKeyboard(chatId) {
   }
 }
 
+// ✨ Language-Cycling Intro (5 grootste talen incl. NL)
+async function languageCyclingIntro(chatId) {
+  const urlSend = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+  const urlEdit = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`;
+
+  const languages = ["English", "Español", "العربية", "中文", "Nederlands"];
+
+  // Eerste message
+  const firstRes = await fetch(urlSend, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: languages[0]
+    })
+  });
+
+  if (!firstRes.ok) {
+    const t = await firstRes.text().catch(() => "");
+    console.error("languageCyclingIntro sendMessage failed:", firstRes.status, t);
+    // fallback: direct naar language keyboard
+    await sendLanguageKeyboard(chatId);
+    return;
+  }
+
+  const data = await firstRes.json().catch(() => null);
+  const messageId = data?.result?.message_id;
+  if (!messageId) {
+    await sendLanguageKeyboard(chatId);
+    return;
+  }
+
+  // Cyclen door de talen
+  for (let i = 1; i < languages.length; i++) {
+    await new Promise((r) => setTimeout(r, 700));
+    await fetch(urlEdit, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        text: languages[i]
+      })
+    }).catch(() => {});
+  }
+
+  // Laatste fade naar neutrale tekst
+  await new Promise((r) => setTimeout(r, 800));
+  await fetch(urlEdit, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text: "Choose your language / Kies je taal:"
+    })
+  }).catch(() => {});
+
+  // En daarna het echte taal-keuze keyboard laten zien
+  await sendLanguageKeyboard(chatId);
+}
+
 async function sendWelcomeCard(chatId) {
   const lang = getLanguage.get(String(chatId))?.language;
 
@@ -293,29 +355,7 @@ async function sendWelcomeCard(chatId) {
     ]
   ];
 
-  // Eerst proberen: animatie (GIF/MP4)
-  if (WELCOME_ANIMATION_URL) {
-    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendAnimation`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        animation: WELCOME_ANIMATION_URL,
-        caption,
-        reply_markup: { inline_keyboard: inlineKeyboard }
-      })
-    });
-    if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      console.error("Telegram sendAnimation failed:", res.status, t);
-      // Fallback op static image/tekst
-      await tgSendPhotoWithButtons(chatId, caption, inlineKeyboard);
-    }
-    return;
-  }
-
-  // Geen animatie ingesteld → fallback naar static
+  // (Eventueel animatie later, nu altijd static image)
   await tgSendPhotoWithButtons(chatId, caption, inlineKeyboard);
 }
 
@@ -329,7 +369,7 @@ async function handleCallback(update) {
 
   if (!chatId || !data) return;
 
-  // Stop de Telegram spinner
+  // Stop Telegram spinner
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/answerCallbackQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -388,15 +428,25 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
     if (!chatId) return;
 
-    // ----- /start: unieke animated welcome card -----
+    // ----- /start: Language-Cycling Intro voor nieuwe users -----
     if (text === "/start") {
       let row = getThread.get(String(chatId));
       if (!row?.thread_id) {
         const threadId = await openaiCreateThread();
         upsertThread.run(String(chatId), threadId, row?.language || null, Date.now());
+        row = { thread_id: threadId, language: row?.language || null };
       }
 
-      await sendWelcomeCard(chatId);
+      const existingLang = row?.language || getLanguage.get(String(chatId))?.language || null;
+
+      if (existingLang) {
+        // Als we de taal al kennen → direct welcome card in die taal
+        await sendWelcomeCard(chatId);
+      } else {
+        // Nog geen taal → Language-Cycling Intro
+        await languageCyclingIntro(chatId);
+      }
+
       return;
     }
 
@@ -415,7 +465,6 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
         const newThread = await openaiCreateThread();
         upsertThread.run(String(chatId), newThread, langCode, Date.now());
       } else {
-        // alleen taal bijwerken
         setLanguage.run(langCode, String(chatId));
       }
 
