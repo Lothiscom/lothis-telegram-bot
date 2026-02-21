@@ -5,7 +5,7 @@ import fetch from "node-fetch";
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-const OPENAI_PROMPT_ID = process.env.OPENAI_PROMPT_ID; // jouw pmpt_...
+const OPENAI_PROMPT_ID = process.env.OPENAI_PROMPT_ID; // pmpt_...
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
@@ -14,7 +14,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 const WELCOME_ANIMATION_URL = process.env.WELCOME_ANIMATION_URL || "";
 const WELCOME_IMAGE_URL =
   process.env.WELCOME_IMAGE_URL ||
-  "http://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg";
+  "https://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg"; // ✅ https
 
 if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_PROMPT_ID || !PUBLIC_BASE_URL || !WEBHOOK_SECRET) {
   console.error(
@@ -27,29 +27,17 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 // ---------- In-memory state (beta) ----------
-// Reset bij deploy/restart. (Later naar Postgres/persistent storage.)
 const stateByChat = new Map(); // chatId -> { prevId, language }
 
-// helpers
 function getState(chatId) {
   const key = String(chatId);
   if (!stateByChat.has(key)) stateByChat.set(key, { prevId: null, language: null });
   return stateByChat.get(key);
 }
-function setLanguage(chatId, lang) {
-  const s = getState(chatId);
-  s.language = lang;
-}
-function getLanguage(chatId) {
-  return getState(chatId).language;
-}
-function setPrevId(chatId, prevId) {
-  const s = getState(chatId);
-  s.prevId = prevId;
-}
-function getPrevId(chatId) {
-  return getState(chatId).prevId;
-}
+function setLanguage(chatId, lang) { getState(chatId).language = lang; }
+function getLanguage(chatId) { return getState(chatId).language; }
+function setPrevId(chatId, prevId) { getState(chatId).prevId = prevId; }
+function getPrevId(chatId) { return getState(chatId).prevId; }
 
 // ---------- Telegram helpers ----------
 async function tgSendMessage(chatId, text) {
@@ -59,7 +47,7 @@ async function tgSendMessage(chatId, text) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
-      text,
+      text: String(text || ""),
       disable_web_page_preview: true
     })
   });
@@ -71,21 +59,7 @@ async function tgSendMessage(chatId, text) {
 
 async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
   if (!WELCOME_IMAGE_URL) {
-    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: caption,
-        reply_markup: { inline_keyboard: inlineKeyboard }
-      })
-    });
-    if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      console.error("Telegram sendMessage (welcome fallback) failed:", res.status, t);
-    }
-    return;
+    return tgSendMessage(chatId, caption);
   }
 
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto`;
@@ -127,15 +101,29 @@ function extractOutputText(json) {
   return out.trim();
 }
 
+function telegramFormattingInstruction() {
+  return [
+    "Format for Telegram: plain text only.",
+    "Use short paragraphs and blank lines.",
+    "No markdown, no **bold**, no special bullet symbols.",
+    "If you need a list: use simple numbering like '1) ...' on separate lines."
+  ].join("\n");
+}
+
 async function openaiRespond({ chatId, userText, lang }) {
   const prev = getPrevId(chatId);
+
+  const instructions = [
+    lang ? `Respond in language: ${lang}` : null,
+    telegramFormattingInstruction()
+  ].filter(Boolean).join("\n\n");
 
   const body = {
     model: OPENAI_MODEL,
     prompt: { id: OPENAI_PROMPT_ID },
     input: [{ role: "user", content: userText }],
     previous_response_id: prev || undefined,
-    instructions: lang ? `Respond in language: ${lang}` : undefined
+    instructions
   };
 
   const res = await fetch("https://api.openai.com/v1/responses", {
@@ -152,7 +140,7 @@ async function openaiRespond({ chatId, userText, lang }) {
   const json = await res.json();
   const text = extractOutputText(json);
 
-  setPrevId(chatId, json.id); // chain context
+  setPrevId(chatId, json.id);
   return text;
 }
 
@@ -220,8 +208,6 @@ async function languageCyclingIntro(chatId) {
   });
 
   if (!firstRes.ok) {
-    const t = await firstRes.text().catch(() => "");
-    console.error("languageCyclingIntro sendMessage failed:", firstRes.status, t);
     await sendLanguageKeyboard(chatId);
     return;
   }
@@ -268,6 +254,7 @@ async function sendWelcomeCard(chatId) {
 
   const startLabel =
     lang === "nl" ? "💬 Praat met Lothis" : lang === "de" ? "💬 Mit Lothis chatten" : "💬 Start chat";
+
   const langLabel =
     lang === "nl" ? "🌍 Taal kiezen" : lang === "de" ? "🌍 Sprache wählen" : "🌍 Choose language";
 
@@ -320,14 +307,13 @@ async function handleCallback(update) {
   }
 }
 
-// ---------- Webhook endpoint (blijft hetzelfde pad als jullie al hadden) ----------
+// ---------- Webhook endpoint ----------
 app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
   res.sendStatus(200);
 
   try {
     const update = req.body;
 
-    // callbacks
     if (update.callback_query) {
       await handleCallback(update);
       return;
@@ -359,33 +345,16 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
       const langCode = languages[text];
       setLanguage(chatId, langCode);
 
-      const confirmText =
-        langCode === "nl"
-          ? "Top, we praten Nederlands. Waar zit je hoofd nu het meeste mee?"
-          : langCode === "en"
-          ? "Nice, we’ll talk in English. What’s on your mind right now?"
-          : "Super, wir sprechen Deutsch. Woran denkst du gerade am meisten?";
-
-      const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
-      await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: confirmText,
-          reply_markup: { remove_keyboard: true }
-        })
-      });
+      // ✅ Direct welcome card met afbeelding + knoppen
+      await sendWelcomeCard(chatId);
       return;
     }
 
-    // non-text
     if (!text) {
       await tgSendMessage(chatId, "Stuur me even in tekst wat je bedoelt, dan pak ik ’m meteen.");
       return;
     }
 
-    // normal message -> OpenAI
     const reply = await lothisReply(chatId, text);
     await tgSendMessage(chatId, reply);
 
@@ -402,18 +371,4 @@ app.get("/", (_req, res) => res.send("Lothis Telegram Bot is running ✨"));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Lothis Telegram Bot running on :${PORT}`);
-  console.log("Health:", `http://localhost:${PORT}/health`);
 });
-
-// ---------- Set Telegram webhook (run once manually) ----------
-export async function setWebhook() {
-  const webhookUrl = `${PUBLIC_BASE_URL}/telegram/${WEBHOOK_SECRET}`;
-  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook`;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url: webhookUrl })
-  });
-  const j = await r.json().catch(() => ({}));
-  console.log("setWebhook:", j);
-}
