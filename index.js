@@ -5,7 +5,11 @@ import fetch from "node-fetch";
 // ---------- ENV ----------
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
+
+// NEW (Prompts)
+const OPENAI_PROMPT_ID = process.env.OPENAI_PROMPT_ID;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
@@ -17,9 +21,9 @@ const WELCOME_IMAGE_URL =
   process.env.WELCOME_IMAGE_URL ||
   "http://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg";
 
-if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_ASSISTANT_ID || !PUBLIC_BASE_URL) {
+if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_PROMPT_ID || !PUBLIC_BASE_URL) {
   console.error(
-    "Missing env vars. Need TELEGRAM_TOKEN, OPENAI_API_KEY, OPENAI_ASSISTANT_ID, PUBLIC_BASE_URL"
+    "Missing env vars. Need TELEGRAM_TOKEN, OPENAI_API_KEY, OPENAI_PROMPT_ID, PUBLIC_BASE_URL"
   );
   process.exit(1);
 }
@@ -27,35 +31,39 @@ if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_ASSISTANT_ID || !PUBLIC_BASE_U
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ---------- DB (chat_id -> thread_id + language) ----------
+// ---------- DB (chat_id -> previous_response_id + language) ----------
+// We maken een nieuwe tabel zodat je oude Assistants-threads niet in de weg zitten.
 const db = new Database("lothis.sqlite");
 db.exec(`
-  CREATE TABLE IF NOT EXISTS threads (
-    chat_id    TEXT PRIMARY KEY,
-    thread_id  TEXT NOT NULL,
-    language   TEXT,
-    updated_at INTEGER NOT NULL
+  CREATE TABLE IF NOT EXISTS conversations (
+    chat_id              TEXT PRIMARY KEY,
+    previous_response_id TEXT,
+    language             TEXT,
+    updated_at           INTEGER NOT NULL
   );
 `);
 
-const getThread = db.prepare("SELECT thread_id, language FROM threads WHERE chat_id = ?");
-const upsertThread = db.prepare(`
-  INSERT INTO threads (chat_id, thread_id, language, updated_at)
+const getConv = db.prepare(
+  "SELECT previous_response_id, language FROM conversations WHERE chat_id = ?"
+);
+
+const upsertConv = db.prepare(`
+  INSERT INTO conversations (chat_id, previous_response_id, language, updated_at)
   VALUES (?, ?, ?, ?)
   ON CONFLICT(chat_id) DO UPDATE SET
-    thread_id  = excluded.thread_id,
-    language   = COALESCE(excluded.language, threads.language),
-    updated_at = excluded.updated_at
+    previous_response_id = COALESCE(excluded.previous_response_id, conversations.previous_response_id),
+    language             = COALESCE(excluded.language, conversations.language),
+    updated_at           = excluded.updated_at
 `);
 
 const setLanguage = db.prepare(`
-  UPDATE threads
-  SET language = ?
+  UPDATE conversations
+  SET language = ?, updated_at = ?
   WHERE chat_id = ?
 `);
 
 const getLanguage = db.prepare(`
-  SELECT language FROM threads WHERE chat_id = ?
+  SELECT language FROM conversations WHERE chat_id = ?
 `);
 
 // ---------- Telegram helpers ----------
@@ -114,119 +122,81 @@ async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
   }
 }
 
-// ---------- OpenAI Assistants v2 helpers ----------
+// ---------- OpenAI Responses helpers ----------
 const OPENAI_HEADERS = {
   Authorization: `Bearer ${OPENAI_API_KEY}`,
-  "Content-Type": "application/json",
-  "OpenAI-Beta": "assistants=v2"
+  "Content-Type": "application/json"
 };
 
-async function openaiCreateThread() {
-  const res = await fetch("https://api.openai.com/v1/threads", {
-    method: "POST",
-    headers: OPENAI_HEADERS,
-    body: JSON.stringify({})
-  });
-  if (!res.ok) throw new Error(`Create thread failed: ${res.status} ${await res.text()}`);
-  const json = await res.json();
-  return json.id;
-}
-
-async function openaiAddUserMessage(threadId, content) {
-  const res = await fetch(`https://api.openai.com/v1/threads/${threadId}/messages`, {
-    method: "POST",
-    headers: OPENAI_HEADERS,
-    body: JSON.stringify({ role: "user", content })
-  });
-  if (!res.ok) throw new Error(`Add message failed: ${res.status} ${await res.text()}`);
-}
-
-async function openaiRun(threadId, lang) {
-  const body = lang
-    ? {
-        assistant_id: OPENAI_ASSISTANT_ID,
-        instructions: `Respond in language: ${lang}`
-      }
-    : {
-        assistant_id: OPENAI_ASSISTANT_ID
-      };
-
-  const res = await fetch(`https://api.openai.com/v1/threads/${threadId}/runs`, {
-    method: "POST",
-    headers: OPENAI_HEADERS,
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) throw new Error(`Run failed: ${res.status} ${await res.text()}`);
-  const json = await res.json();
-  return json.id;
-}
-
-async function openaiPollRun(threadId, runId, maxMs = 25000) {
-  const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    const res = await fetch(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, {
-      method: "GET",
-      headers: OPENAI_HEADERS
-    });
-    if (!res.ok) throw new Error(`Poll failed: ${res.status} ${await res.text()}`);
-    const json = await res.json();
-    const status = json.status;
-
-    if (status === "completed") return "completed";
-    if (status === "failed" || status === "cancelled" || status === "expired") return status;
-
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  return "timeout";
-}
-
-async function openaiGetLastAssistantText(threadId) {
-  const res = await fetch(
-    `https://api.openai.com/v1/threads/${threadId}/messages?limit=10&order=desc`,
-    { method: "GET", headers: OPENAI_HEADERS }
-  );
-  if (!res.ok) throw new Error(`Get messages failed: ${res.status} ${await res.text()}`);
-  const json = await res.json();
-
-  const msg = (json.data || []).find((m) => m.role === "assistant");
-  if (!msg || !Array.isArray(msg.content)) return "";
+function extractOutputText(json) {
+  // Responses geeft vaak output_text; maar we hebben een fallback.
+  if (typeof json?.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
 
   let out = "";
-  for (const block of msg.content) {
-    if (block?.type === "text" && block?.text?.value) out += block.text.value;
+  const output = json?.output || [];
+  for (const item of output) {
+    const content = item?.content || [];
+    for (const c of content) {
+      if (c?.type === "output_text" && c?.text) out += c.text;
+      if (c?.type === "text" && typeof c?.text === "string") out += c.text;
+      if (c?.type === "text" && c?.text?.value) out += c.text.value;
+    }
   }
   return out.trim();
 }
 
-async function lothisReply(chatId, userText) {
-  let row = getThread.get(String(chatId));
-  let threadId = row?.thread_id;
-  const existingLang = row?.language || null;
+async function openaiRespond({ chatId, userText, lang }) {
+  const row = getConv.get(String(chatId));
+  const prev = row?.previous_response_id || null;
 
-  if (!threadId) {
-    threadId = await openaiCreateThread();
-    upsertThread.run(String(chatId), threadId, existingLang, Date.now());
+  const body = {
+    model: OPENAI_MODEL,
+    prompt: { id: OPENAI_PROMPT_ID },
+    input: [{ role: "user", content: userText }],
+    previous_response_id: prev || undefined,
+    // taal-instructie (zodat jullie geen [LANG:xx] hacks nodig hebben)
+    instructions: lang ? `Respond in language: ${lang}` : undefined
+  };
+
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: OPENAI_HEADERS,
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Responses failed: ${res.status} ${t}`);
   }
 
-  const lang = existingLang || getLanguage.get(String(chatId))?.language || null;
-  const content = lang ? `[LANG:${lang}] ${userText}` : userText;
+  const json = await res.json();
+  const text = extractOutputText(json);
 
-  await openaiAddUserMessage(threadId, content);
-  const runId = await openaiRun(threadId, lang);
-  const status = await openaiPollRun(threadId, runId);
+  // update conv state
+  upsertConv.run(String(chatId), json.id, row?.language || null, Date.now());
 
-  if (status !== "completed") {
+  return text;
+}
+
+async function lothisReply(chatId, userText) {
+  // Zorg dat er altijd een row bestaat (handig voor language/state)
+  const row = getConv.get(String(chatId));
+  if (!row) upsertConv.run(String(chatId), null, null, Date.now());
+
+  const lang = getLanguage.get(String(chatId))?.language || null;
+
+  try {
+    const text = await openaiRespond({ chatId, userText, lang });
+    return text || "Ik hoor je. Wil je dat nog één keer zeggen?";
+  } catch (e) {
+    console.error("OpenAI error:", e);
     return "Ik ben er heel even niet lekker doorheen. Probeer het zo nog een keer.";
   }
-
-  const text = await openaiGetLastAssistantText(threadId);
-  return text || "Ik hoorde je, maar ik kreeg net even geen goede reply terug. Wil je het nog een keer zeggen?";
 }
 
 // ---------- UI helpers ----------
 async function sendLanguageKeyboard(chatId) {
   const lang = getLanguage.get(String(chatId))?.language;
-
   const text =
     lang === "nl"
       ? "Kies even de taal waarin je wilt praten:"
@@ -252,6 +222,7 @@ async function sendLanguageKeyboard(chatId) {
       }
     })
   });
+
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     console.error("Telegram sendMessage (language keyboard) failed:", res.status, t);
@@ -262,7 +233,6 @@ async function sendLanguageKeyboard(chatId) {
 async function languageCyclingIntro(chatId) {
   const urlSend = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
   const urlEdit = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`;
-
   const lines = [
     "Welcome at Lothis _",
     "Bienvenido a Lothis _",
@@ -275,10 +245,7 @@ async function languageCyclingIntro(chatId) {
   const firstRes = await fetch(urlSend, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: lines[0]
-    })
+    body: JSON.stringify({ chat_id: chatId, text: lines[0] })
   });
 
   if (!firstRes.ok) {
@@ -290,6 +257,7 @@ async function languageCyclingIntro(chatId) {
 
   const data = await firstRes.json().catch(() => null);
   const messageId = data?.result?.message_id;
+
   if (!messageId) {
     await sendLanguageKeyboard(chatId);
     return;
@@ -301,11 +269,7 @@ async function languageCyclingIntro(chatId) {
     await fetch(urlEdit, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_id: messageId,
-        text: lines[i]
-      })
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, text: lines[i] })
     }).catch(() => {});
   }
 
@@ -321,7 +285,6 @@ async function languageCyclingIntro(chatId) {
     })
   }).catch(() => {});
 
-  // Laat het keyboard zien
   await sendLanguageKeyboard(chatId);
 }
 
@@ -352,12 +315,7 @@ async function sendWelcomeCard(chatId) {
   const inlineKeyboard = [
     [{ text: startLabel, callback_data: "start_chat" }],
     [{ text: langLabel, callback_data: "choose_lang" }],
-    [
-      {
-        text: "✨ What is Lothis?",
-        url: "https://lothis.com"
-      }
-    ]
+    [{ text: "✨ What is Lothis?", url: "https://lothis.com" }]
   ];
 
   await tgSendPhotoWithButtons(chatId, caption, inlineKeyboard);
@@ -370,7 +328,6 @@ async function handleCallback(update) {
 
   const chatId = callback.message?.chat?.id;
   const data = callback.data;
-
   if (!chatId || !data) return;
 
   // Stop Telegram spinner
@@ -389,10 +346,7 @@ async function handleCallback(update) {
 
   if (data === "start_chat") {
     if (!lang) {
-      await tgSendMessage(
-        chatId,
-        "Kies eerst even een taal, dan kunnen we echt goed praten. 🙂"
-      );
+      await tgSendMessage(chatId, "Kies eerst even een taal, dan kunnen we echt goed praten. 🙂");
       await sendLanguageKeyboard(chatId);
       return;
     }
@@ -429,26 +383,20 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
     const chatId = message.chat?.id;
     const text = message.text?.trim();
-
     if (!chatId) return;
 
     // ----- /start: Language-Cycling Intro voor nieuwe users, anders direct welcome card -----
     if (text === "/start") {
-      let row = getThread.get(String(chatId));
-      if (!row?.thread_id) {
-        const threadId = await openaiCreateThread();
-        upsertThread.run(String(chatId), threadId, row?.language || null, Date.now());
-        row = { thread_id: threadId, language: row?.language || null };
-      }
+      // Zorg dat conv row bestaat
+      const row = getConv.get(String(chatId));
+      if (!row) upsertConv.run(String(chatId), null, null, Date.now());
 
-      const existingLang = row?.language || getLanguage.get(String(chatId))?.language || null;
-
+      const existingLang = getLanguage.get(String(chatId))?.language || null;
       if (existingLang) {
         await sendWelcomeCard(chatId);
       } else {
         await languageCyclingIntro(chatId);
       }
-
       return;
     }
 
@@ -459,16 +407,12 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
       "🇩🇪 Deutsch": "de"
     };
 
-    if (languages[text]) {
+    if (text && languages[text]) {
       const langCode = languages[text];
 
-      let row = getThread.get(String(chatId));
-      if (!row?.thread_id) {
-        const newThread = await openaiCreateThread();
-        upsertThread.run(String(chatId), newThread, langCode, Date.now());
-      } else {
-        setLanguage.run(langCode, String(chatId));
-      }
+      const row = getConv.get(String(chatId));
+      if (!row) upsertConv.run(String(chatId), null, langCode, Date.now());
+      else setLanguage.run(langCode, Date.now(), String(chatId));
 
       const confirmText =
         langCode === "nl"
@@ -484,9 +428,7 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
         body: JSON.stringify({
           chat_id: chatId,
           text: confirmText,
-          reply_markup: {
-            remove_keyboard: true
-          }
+          reply_markup: { remove_keyboard: true }
         })
       });
 
@@ -499,9 +441,10 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
       return;
     }
 
-    // Normale message → naar Lothis
+    // Normale message → naar Lothis (Responses)
     const reply = await lothisReply(chatId, text);
     await tgSendMessage(chatId, reply);
+
   } catch (e) {
     console.error("Webhook error:", e);
   }
@@ -509,10 +452,7 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
 // ---------- Health & root ----------
 app.get("/health", (req, res) => res.json({ ok: true }));
-
-app.get("/", (req, res) => {
-  res.send("Lothis Telegram Bot is running ✨");
-});
+app.get("/", (req, res) => res.send("Lothis Telegram Bot is running ✨"));
 
 // ---------- Start ----------
 const PORT = process.env.PORT || 3000;
