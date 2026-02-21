@@ -13,7 +13,13 @@ const WELCOME_IMAGE_URL =
   process.env.WELCOME_IMAGE_URL ||
   "https://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg";
 
-if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_PROMPT_ID || !PUBLIC_BASE_URL || !WEBHOOK_SECRET) {
+if (
+  !TELEGRAM_TOKEN ||
+  !OPENAI_API_KEY ||
+  !OPENAI_PROMPT_ID ||
+  !PUBLIC_BASE_URL ||
+  !WEBHOOK_SECRET
+) {
   console.error(
     "Missing env vars. Need TELEGRAM_TOKEN, OPENAI_API_KEY, OPENAI_PROMPT_ID, PUBLIC_BASE_URL, WEBHOOK_SECRET"
   );
@@ -24,14 +30,16 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 // =================== STATE (in-memory beta) ===================
-// Reset bij deploy/restart. Perfect voor nu; later kun je dit persistent maken.
 const stateByChat = new Map(); // chatId -> { prevId, lang, mode }
 
 function getState(chatId) {
   const key = String(chatId);
-  if (!stateByChat.has(key)) stateByChat.set(key, { prevId: null, lang: null, mode: "reflect" });
+  if (!stateByChat.has(key)) {
+    stateByChat.set(key, { prevId: null, lang: null, mode: "reflect" });
+  }
   return stateByChat.get(key);
 }
+
 function resetState(chatId) {
   stateByChat.set(String(chatId), { prevId: null, lang: null, mode: "reflect" });
 }
@@ -81,23 +89,21 @@ async function tgAnswerCallbackQuery(callbackQueryId) {
 }
 
 async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
-  // Telegram wil vaak https + publiek toegankelijk
-  if (!WELCOME_IMAGE_URL) {
-    return tgSendMessage(chatId, caption, { reply_markup: { inline_keyboard: inlineKeyboard } });
+  // 1) Probeer foto + knoppen
+  if (WELCOME_IMAGE_URL) {
+    const res = await tgApi("sendPhoto", {
+      chat_id: chatId,
+      photo: WELCOME_IMAGE_URL,
+      caption,
+      reply_markup: { inline_keyboard: inlineKeyboard },
+    });
+    if (res) return res;
   }
 
-  const res = await tgApi("sendPhoto", {
-    chat_id: chatId,
-    photo: WELCOME_IMAGE_URL,
-    caption,
+  // 2) Fallback: tekst + knoppen
+  return tgSendMessage(chatId, caption, {
     reply_markup: { inline_keyboard: inlineKeyboard },
   });
-
-  // Fallback naar tekst als Telegram de foto weigert
-  if (!res) {
-    return tgSendMessage(chatId, caption, { reply_markup: { inline_keyboard: inlineKeyboard } });
-  }
-  return res;
 }
 
 // =================== OPENAI (Responses + Prompt) ===================
@@ -107,7 +113,9 @@ const OPENAI_HEADERS = {
 };
 
 function extractOutputText(json) {
-  if (typeof json?.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
+  if (typeof json?.output_text === "string" && json.output_text.trim()) {
+    return json.output_text.trim();
+  }
   let out = "";
   const output = json?.output || [];
   for (const item of output) {
@@ -126,13 +134,11 @@ function telegramFormattingInstruction() {
     "Format for Telegram: plain text only.",
     "Use short paragraphs and blank lines.",
     "No markdown, no **bold**, no special bullet symbols.",
-    "If you need a list: use simple numbering like '1) ...' on separate lines.",
-    "Keep it calm, minimal, and non-judgmental."
+    "If you need a list: use simple numbering like '1) ...' on separate lines."
   ].join("\n");
 }
 
 function modeInstruction(mode) {
-  // Unieke ‘modes’ zonder therapie-claims; gewoon stijl/tempo.
   if (mode === "clarity") {
     return [
       "Mode: CLARITY.",
@@ -145,8 +151,7 @@ function modeInstruction(mode) {
     return [
       "Mode: BREATHE.",
       "Keep it very gentle and simple.",
-      "Use short, soothing sentences.",
-      "Offer a tiny grounding routine in plain language (no medical claims)."
+      "Use short, soothing sentences."
     ].join("\n");
   }
   return [
@@ -159,7 +164,6 @@ function modeInstruction(mode) {
 
 async function openaiRespond({ chatId, userText }) {
   const st = getState(chatId);
-  const prev = st.prevId;
 
   const instructions = [
     st.lang ? `Respond in language: ${st.lang}` : null,
@@ -172,7 +176,7 @@ async function openaiRespond({ chatId, userText }) {
     model: OPENAI_MODEL,
     prompt: { id: OPENAI_PROMPT_ID },
     input: [{ role: "user", content: userText }],
-    previous_response_id: prev || undefined,
+    previous_response_id: st.prevId || undefined,
     instructions,
   };
 
@@ -188,22 +192,17 @@ async function openaiRespond({ chatId, userText }) {
   }
 
   const json = await res.json();
-  const text = extractOutputText(json);
   st.prevId = json.id;
-
-  return text;
+  return extractOutputText(json);
 }
 
-// =================== LOTHIS UI COPY ===================
+// =================== COPY ===================
 function t(lang, key) {
   const L = lang || "en";
   const dict = {
     en: {
-      welcomeTitle: "Welcome to Lothis",
-      welcomeBody:
-        "A calm space to talk, reflect, and find clarity.\n\nChoose how you want to enter:",
-      chooseVoice: "Choose your voice",
       chooseLanguage: "Choose your language:",
+      welcomeBody: "A calm space to talk, reflect, and find clarity.\n\nChoose how you want to enter:",
       startReflect: "Enter: Reflect",
       startClarity: "Enter: Clarity",
       startBreathe: "Enter: Breathe",
@@ -212,13 +211,12 @@ function t(lang, key) {
       whatIs: "What is Lothis?",
       firstPrompt: "I’m here. What’s on your mind right now?",
       langSet: "Got it. From now on we’ll talk in English.",
+      resetDone: "Reset done. Type /start.",
+      sendText: "Send it as text and I’ll catch it immediately."
     },
     nl: {
-      welcomeTitle: "Welkom bij Lothis",
-      welcomeBody:
-        "Je rustige plek om te praten zonder oordeel.\n\nKies hoe je wilt binnenkomen:",
-      chooseVoice: "Kies je stem",
       chooseLanguage: "Kies je taal:",
+      welcomeBody: "Je rustige plek om te praten zonder oordeel.\n\nKies hoe je wilt binnenkomen:",
       startReflect: "Binnenkomen: Reflect",
       startClarity: "Binnenkomen: Clarity",
       startBreathe: "Binnenkomen: Breathe",
@@ -227,13 +225,12 @@ function t(lang, key) {
       whatIs: "Wat is Lothis?",
       firstPrompt: "Ik ben er. Waar zit je hoofd nu het meeste mee?",
       langSet: "Top. Vanaf nu praten we Nederlands.",
+      resetDone: "Reset klaar. Typ /start.",
+      sendText: "Stuur het even als tekst, dan pak ik ’m meteen."
     },
     de: {
-      welcomeTitle: "Willkommen bei Lothis",
-      welcomeBody:
-        "Ein ruhiger Raum zum Reden, Nachdenken und Klarwerden.\n\nWähle deinen Einstieg:",
-      chooseVoice: "Wähle deine Stimme",
       chooseLanguage: "Sprache wählen:",
+      welcomeBody: "Ein ruhiger Raum zum Reden und Klarwerden.\n\nWähle deinen Einstieg:",
       startReflect: "Einstieg: Reflect",
       startClarity: "Einstieg: Clarity",
       startBreathe: "Einstieg: Breathe",
@@ -242,21 +239,21 @@ function t(lang, key) {
       whatIs: "Was ist Lothis?",
       firstPrompt: "Ich bin da. Woran denkst du gerade am meisten?",
       langSet: "Alles klar. Ab jetzt sprechen wir Deutsch.",
+      resetDone: "Reset fertig. Tippe /start.",
+      sendText: "Bitte als Text senden, dann antworte ich sofort."
     },
   };
-
-  return (dict[L] && dict[L][key]) || dict.en[key] || key;
+  return dict[L]?.[key] || dict.en[key] || key;
 }
 
-// =================== “FOCUS ARC” INTRO (message edits) ===================
-async function focusArcIntro(chatId, lang) {
-  // We sturen 1 bericht en “tekenen” daarna een arc via edits (cool en uniek).
+// =================== FLOWS ===================
+async function focusArcIntro(chatId, lang = "en") {
   const frames = [
-    "   ◜        ◝\n\n" + t(lang, "welcomeTitle"),
-    "  ◜◝       ◜◝\n\n" + t(lang, "welcomeTitle"),
-    " ◜  ◝     ◜  ◝\n\n" + t(lang, "welcomeTitle"),
-    "◜    ◝   ◜    ◝\n\n" + t(lang, "welcomeTitle"),
-    "◜      ◝ ◜      ◝\n\n" + t(lang, "welcomeTitle"),
+    "   ◜        ◝\n\nLothis",
+    "  ◜◝       ◜◝\n\nLothis",
+    " ◜  ◝     ◜  ◝\n\nLothis",
+    "◜    ◝   ◜    ◝\n\nLothis",
+    "◜      ◝ ◜      ◝\n\nLothis",
   ];
 
   const first = await tgSendMessage(chatId, frames[0]);
@@ -264,21 +261,24 @@ async function focusArcIntro(chatId, lang) {
   if (!messageId) return;
 
   for (let i = 1; i < frames.length; i++) {
-    await new Promise((r) => setTimeout(r, 550));
+    await new Promise((r) => setTimeout(r, 450));
     await tgEditMessageText(chatId, messageId, frames[i]).catch(() => {});
   }
-
-  await new Promise((r) => setTimeout(r, 450));
-  await tgEditMessageText(chatId, messageId, t(lang, "chooseLanguage")).catch(() => {});
+  // Let op: we sturen taalbuttons als apart bericht MET tekst,
+  // dus we laten dit laatste frame niet hangen op "Choose your language".
 }
 
-async function showLanguageInline(chatId) {
+async function showLanguageInline(chatId, lang = "en") {
   const inlineKeyboard = [
     [{ text: "🇳🇱 Nederlands", callback_data: "set_lang:nl" }],
     [{ text: "🇬🇧 English", callback_data: "set_lang:en" }],
     [{ text: "🇩🇪 Deutsch", callback_data: "set_lang:de" }],
   ];
-  await tgSendMessage(chatId, " ", { reply_markup: { inline_keyboard: inlineKeyboard } });
+
+  // ✅ Belangrijk: keyboard in hetzelfde bericht met échte tekst
+  await tgSendMessage(chatId, t(lang, "chooseLanguage"), {
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  });
 }
 
 async function showWelcomeCard(chatId) {
@@ -309,18 +309,17 @@ async function handleCallback(update) {
   if (!chatId || !data) return;
 
   await tgAnswerCallbackQuery(cb.id).catch(() => {});
-
   const st = getState(chatId);
 
   if (data === "choose_lang") {
     await focusArcIntro(chatId, st.lang || "en");
-    await showLanguageInline(chatId);
+    await showLanguageInline(chatId, st.lang || "en");
     return;
   }
 
   if (data === "reset") {
     resetState(chatId);
-    await tgSendMessage(chatId, "Reset done. /start");
+    await tgSendMessage(chatId, t("en", "resetDone"));
     return;
   }
 
@@ -333,15 +332,9 @@ async function handleCallback(update) {
   }
 
   if (data.startsWith("set_mode:")) {
-    const mode = data.split(":")[1];
-    st.mode = mode;
-
-    // Kleine “presence” microcopy
+    st.mode = data.split(":")[1];
     const lang = st.lang || "en";
-    const label =
-      mode === "clarity" ? "Clarity" : mode === "breathe" ? "Breathe" : "Reflect";
-
-    await tgSendMessage(chatId, `Entering: ${label}\n\n${t(lang, "firstPrompt")}`);
+    await tgSendMessage(chatId, t(lang, "firstPrompt"));
     return;
   }
 }
@@ -353,7 +346,6 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
   try {
     const update = req.body;
 
-    // callbacks
     if (update.callback_query) {
       await handleCallback(update);
       return;
@@ -364,53 +356,41 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
     const chatId = msg.chat?.id;
     const text = msg.text?.trim();
-
     if (!chatId) return;
 
-    // /start
     if (text === "/start") {
       const st = getState(chatId);
-      // Intro + taal als die er nog niet is, anders direct welcome
       if (!st.lang) {
         await focusArcIntro(chatId, "en");
-        await showLanguageInline(chatId);
+        await showLanguageInline(chatId, "en");
       } else {
         await showWelcomeCard(chatId);
       }
       return;
     }
 
-    // /reset
     if (text === "/reset") {
       resetState(chatId);
-      await tgSendMessage(chatId, "Reset done. Type /start");
+      await tgSendMessage(chatId, t("en", "resetDone"));
       return;
     }
 
-    // non-text
     if (!text) {
-      await tgSendMessage(chatId, "Send it as text, and I’ll catch it immediately.");
+      const st = getState(chatId);
+      await tgSendMessage(chatId, t(st.lang || "en", "sendText"));
       return;
     }
 
-    // Als nog geen taal is gekozen: stuur taalflow
     const st = getState(chatId);
     if (!st.lang) {
       await focusArcIntro(chatId, "en");
-      await showLanguageInline(chatId);
+      await showLanguageInline(chatId, "en");
       return;
     }
 
-    // “presence”
     tgSendChatAction(chatId, "typing").catch(() => {});
-    await new Promise((r) => setTimeout(r, 350));
-
     const reply = await openaiRespond({ chatId, userText: text });
-
-    await tgSendMessage(
-      chatId,
-      reply || (st.lang === "nl" ? "Ik hoor je. Zeg het nog één keer?" : "I’m here. Say that once more?")
-    );
+    await tgSendMessage(chatId, reply || "…");
   } catch (e) {
     console.error("Webhook error:", e);
   }
