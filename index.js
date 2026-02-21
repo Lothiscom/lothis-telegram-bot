@@ -1,29 +1,24 @@
 import express from "express";
-import Database from "better-sqlite3";
 import fetch from "node-fetch";
 
 // ---------- ENV ----------
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// NEW (Prompts)
-const OPENAI_PROMPT_ID = process.env.OPENAI_PROMPT_ID;
+const OPENAI_PROMPT_ID = process.env.OPENAI_PROMPT_ID; // jouw pmpt_...
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
-// Animatie gebruiken we nu niet (maar houden de var zodat je later makkelijk kunt omschakelen)
 const WELCOME_ANIMATION_URL = process.env.WELCOME_ANIMATION_URL || "";
-
-// Static welcome image (jouw lotus-afbeelding als default)
 const WELCOME_IMAGE_URL =
   process.env.WELCOME_IMAGE_URL ||
   "http://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg";
 
-if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_PROMPT_ID || !PUBLIC_BASE_URL) {
+if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_PROMPT_ID || !PUBLIC_BASE_URL || !WEBHOOK_SECRET) {
   console.error(
-    "Missing env vars. Need TELEGRAM_TOKEN, OPENAI_API_KEY, OPENAI_PROMPT_ID, PUBLIC_BASE_URL"
+    "Missing env vars. Need TELEGRAM_TOKEN, OPENAI_API_KEY, OPENAI_PROMPT_ID, PUBLIC_BASE_URL, WEBHOOK_SECRET"
   );
   process.exit(1);
 }
@@ -31,40 +26,30 @@ if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_PROMPT_ID || !PUBLIC_BASE_URL)
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ---------- DB (chat_id -> previous_response_id + language) ----------
-// We maken een nieuwe tabel zodat je oude Assistants-threads niet in de weg zitten.
-const db = new Database("lothis.sqlite");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS conversations (
-    chat_id              TEXT PRIMARY KEY,
-    previous_response_id TEXT,
-    language             TEXT,
-    updated_at           INTEGER NOT NULL
-  );
-`);
+// ---------- In-memory state (beta) ----------
+// Reset bij deploy/restart. (Later naar Postgres/persistent storage.)
+const stateByChat = new Map(); // chatId -> { prevId, language }
 
-const getConv = db.prepare(
-  "SELECT previous_response_id, language FROM conversations WHERE chat_id = ?"
-);
-
-const upsertConv = db.prepare(`
-  INSERT INTO conversations (chat_id, previous_response_id, language, updated_at)
-  VALUES (?, ?, ?, ?)
-  ON CONFLICT(chat_id) DO UPDATE SET
-    previous_response_id = COALESCE(excluded.previous_response_id, conversations.previous_response_id),
-    language             = COALESCE(excluded.language, conversations.language),
-    updated_at           = excluded.updated_at
-`);
-
-const setLanguage = db.prepare(`
-  UPDATE conversations
-  SET language = ?, updated_at = ?
-  WHERE chat_id = ?
-`);
-
-const getLanguage = db.prepare(`
-  SELECT language FROM conversations WHERE chat_id = ?
-`);
+// helpers
+function getState(chatId) {
+  const key = String(chatId);
+  if (!stateByChat.has(key)) stateByChat.set(key, { prevId: null, language: null });
+  return stateByChat.get(key);
+}
+function setLanguage(chatId, lang) {
+  const s = getState(chatId);
+  s.language = lang;
+}
+function getLanguage(chatId) {
+  return getState(chatId).language;
+}
+function setPrevId(chatId, prevId) {
+  const s = getState(chatId);
+  s.prevId = prevId;
+}
+function getPrevId(chatId) {
+  return getState(chatId).prevId;
+}
 
 // ---------- Telegram helpers ----------
 async function tgSendMessage(chatId, text) {
@@ -84,10 +69,8 @@ async function tgSendMessage(chatId, text) {
   }
 }
 
-// Static image welkomstcard (met inline buttons)
 async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
   if (!WELCOME_IMAGE_URL) {
-    // fallback naar tekst-only
     const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
     const res = await fetch(url, {
       method: "POST",
@@ -116,22 +99,21 @@ async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
       reply_markup: { inline_keyboard: inlineKeyboard }
     })
   });
+
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     console.error("Telegram sendPhoto failed:", res.status, t);
   }
 }
 
-// ---------- OpenAI Responses helpers ----------
+// ---------- OpenAI Responses (Prompt) ----------
 const OPENAI_HEADERS = {
   Authorization: `Bearer ${OPENAI_API_KEY}`,
   "Content-Type": "application/json"
 };
 
 function extractOutputText(json) {
-  // Responses geeft vaak output_text; maar we hebben een fallback.
   if (typeof json?.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
-
   let out = "";
   const output = json?.output || [];
   for (const item of output) {
@@ -146,15 +128,13 @@ function extractOutputText(json) {
 }
 
 async function openaiRespond({ chatId, userText, lang }) {
-  const row = getConv.get(String(chatId));
-  const prev = row?.previous_response_id || null;
+  const prev = getPrevId(chatId);
 
   const body = {
     model: OPENAI_MODEL,
     prompt: { id: OPENAI_PROMPT_ID },
     input: [{ role: "user", content: userText }],
     previous_response_id: prev || undefined,
-    // taal-instructie (zodat jullie geen [LANG:xx] hacks nodig hebben)
     instructions: lang ? `Respond in language: ${lang}` : undefined
   };
 
@@ -166,25 +146,18 @@ async function openaiRespond({ chatId, userText, lang }) {
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`Responses failed: ${res.status} ${t}`);
+    throw new Error(`OpenAI responses failed: ${res.status} ${t}`);
   }
 
   const json = await res.json();
   const text = extractOutputText(json);
 
-  // update conv state
-  upsertConv.run(String(chatId), json.id, row?.language || null, Date.now());
-
+  setPrevId(chatId, json.id); // chain context
   return text;
 }
 
 async function lothisReply(chatId, userText) {
-  // Zorg dat er altijd een row bestaat (handig voor language/state)
-  const row = getConv.get(String(chatId));
-  if (!row) upsertConv.run(String(chatId), null, null, Date.now());
-
-  const lang = getLanguage.get(String(chatId))?.language || null;
-
+  const lang = getLanguage(chatId);
   try {
     const text = await openaiRespond({ chatId, userText, lang });
     return text || "Ik hoor je. Wil je dat nog één keer zeggen?";
@@ -196,7 +169,7 @@ async function lothisReply(chatId, userText) {
 
 // ---------- UI helpers ----------
 async function sendLanguageKeyboard(chatId) {
-  const lang = getLanguage.get(String(chatId))?.language;
+  const lang = getLanguage(chatId);
   const text =
     lang === "nl"
       ? "Kies even de taal waarin je wilt praten:"
@@ -229,7 +202,6 @@ async function sendLanguageKeyboard(chatId) {
   }
 }
 
-// ✨ Language-Cycling Intro (5 talen met welkomstzinnen)
 async function languageCyclingIntro(chatId) {
   const urlSend = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
   const urlEdit = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`;
@@ -241,7 +213,6 @@ async function languageCyclingIntro(chatId) {
     "Welkom bij Lothis _"
   ];
 
-  // Eerste message
   const firstRes = await fetch(urlSend, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -257,13 +228,11 @@ async function languageCyclingIntro(chatId) {
 
   const data = await firstRes.json().catch(() => null);
   const messageId = data?.result?.message_id;
-
   if (!messageId) {
     await sendLanguageKeyboard(chatId);
     return;
   }
 
-  // Wissel de talen 1 voor 1
   for (let i = 1; i < lines.length; i++) {
     await new Promise((r) => setTimeout(r, 800));
     await fetch(urlEdit, {
@@ -273,7 +242,6 @@ async function languageCyclingIntro(chatId) {
     }).catch(() => {});
   }
 
-  // Finale tekst
   await new Promise((r) => setTimeout(r, 900));
   await fetch(urlEdit, {
     method: "POST",
@@ -289,7 +257,7 @@ async function languageCyclingIntro(chatId) {
 }
 
 async function sendWelcomeCard(chatId) {
-  const lang = getLanguage.get(String(chatId))?.language;
+  const lang = getLanguage(chatId);
 
   const caption =
     lang === "nl"
@@ -299,18 +267,9 @@ async function sendWelcomeCard(chatId) {
       : "Welcome to Lothis 👋\n\nYour calm space to talk, reflect, and feel supported.\n\nChoose what fits you best right now:";
 
   const startLabel =
-    lang === "nl"
-      ? "💬 Praat met Lothis"
-      : lang === "de"
-      ? "💬 Mit Lothis chatten"
-      : "💬 Start chat";
-
+    lang === "nl" ? "💬 Praat met Lothis" : lang === "de" ? "💬 Mit Lothis chatten" : "💬 Start chat";
   const langLabel =
-    lang === "nl"
-      ? "🌍 Taal kiezen"
-      : lang === "de"
-      ? "🌍 Sprache wählen"
-      : "🌍 Choose language";
+    lang === "nl" ? "🌍 Taal kiezen" : lang === "de" ? "🌍 Sprache wählen" : "🌍 Choose language";
 
   const inlineKeyboard = [
     [{ text: startLabel, callback_data: "start_chat" }],
@@ -330,14 +289,13 @@ async function handleCallback(update) {
   const data = callback.data;
   if (!chatId || !data) return;
 
-  // Stop Telegram spinner
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/answerCallbackQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ callback_query_id: callback.id })
   }).catch(() => {});
 
-  const lang = getLanguage.get(String(chatId))?.language;
+  const lang = getLanguage(chatId);
 
   if (data === "choose_lang") {
     await sendLanguageKeyboard(chatId);
@@ -359,25 +317,22 @@ async function handleCallback(update) {
         : "I’m here. What’s on your mind right now?";
 
     await tgSendMessage(chatId, msg);
-    return;
   }
 }
 
-// ---------- Webhook endpoint ----------
+// ---------- Webhook endpoint (blijft hetzelfde pad als jullie al hadden) ----------
 app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
-  // Telegram expects fast 200 OK
   res.sendStatus(200);
 
   try {
     const update = req.body;
 
-    // 1) inline button callbacks
+    // callbacks
     if (update.callback_query) {
       await handleCallback(update);
       return;
     }
 
-    // 2) normale berichten
     const message = update.message || update.edited_message;
     if (!message) return;
 
@@ -385,22 +340,15 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     const text = message.text?.trim();
     if (!chatId) return;
 
-    // ----- /start: Language-Cycling Intro voor nieuwe users, anders direct welcome card -----
+    // /start
     if (text === "/start") {
-      // Zorg dat conv row bestaat
-      const row = getConv.get(String(chatId));
-      if (!row) upsertConv.run(String(chatId), null, null, Date.now());
-
-      const existingLang = getLanguage.get(String(chatId))?.language || null;
-      if (existingLang) {
-        await sendWelcomeCard(chatId);
-      } else {
-        await languageCyclingIntro(chatId);
-      }
+      const existingLang = getLanguage(chatId);
+      if (existingLang) await sendWelcomeCard(chatId);
+      else await languageCyclingIntro(chatId);
       return;
     }
 
-    // ----- taalkeuze via reply keyboard -----
+    // language selection
     const languages = {
       "🇳🇱 Nederlands": "nl",
       "🇬🇧 English": "en",
@@ -409,10 +357,7 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
     if (text && languages[text]) {
       const langCode = languages[text];
-
-      const row = getConv.get(String(chatId));
-      if (!row) upsertConv.run(String(chatId), null, langCode, Date.now());
-      else setLanguage.run(langCode, Date.now(), String(chatId));
+      setLanguage(chatId, langCode);
 
       const confirmText =
         langCode === "nl"
@@ -431,17 +376,16 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
           reply_markup: { remove_keyboard: true }
         })
       });
-
       return;
     }
 
-    // Geen tekst (voice, foto, etc.)
+    // non-text
     if (!text) {
       await tgSendMessage(chatId, "Stuur me even in tekst wat je bedoelt, dan pak ik ’m meteen.");
       return;
     }
 
-    // Normale message → naar Lothis (Responses)
+    // normal message -> OpenAI
     const reply = await lothisReply(chatId, text);
     await tgSendMessage(chatId, reply);
 
@@ -451,8 +395,8 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 });
 
 // ---------- Health & root ----------
-app.get("/health", (req, res) => res.json({ ok: true }));
-app.get("/", (req, res) => res.send("Lothis Telegram Bot is running ✨"));
+app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/", (_req, res) => res.send("Lothis Telegram Bot is running ✨"));
 
 // ---------- Start ----------
 const PORT = process.env.PORT || 3000;
