@@ -6,12 +6,15 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_PROMPT_ID = process.env.OPENAI_PROMPT_ID; // pmpt_...
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // optional
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
 const WELCOME_IMAGE_URL =
   process.env.WELCOME_IMAGE_URL ||
   "https://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg";
+
+// Metrics/Admin
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || ""; // jouw Telegram chat_id (string)
+const METRICS_TOKEN = process.env.METRICS_TOKEN || ""; // random secret voor /metrics
 
 if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_PROMPT_ID || !WEBHOOK_SECRET) {
   console.error(
@@ -37,6 +40,38 @@ function getState(chatId) {
 
 function resetState(chatId) {
   stateByChat.set(String(chatId), { prevId: null, lang: null, mode: "reflect", stage: "needs_lang" });
+}
+
+// =================== METRICS (in-memory) ===================
+const metrics = {
+  startedAt: Date.now(),
+  totalUpdates: 0,
+  totalMessages: 0,
+  uniqueUsers: new Set(),
+  lastSeenByUser: new Map(),
+  starts: 0,
+};
+
+function trackUpdate(chatId, hasText, textValue) {
+  metrics.totalUpdates += 1;
+
+  if (chatId) {
+    const key = String(chatId);
+    metrics.uniqueUsers.add(key);
+    metrics.lastSeenByUser.set(key, Date.now());
+  }
+
+  if (hasText) metrics.totalMessages += 1;
+  if (textValue === "/start") metrics.starts += 1;
+}
+
+function countActiveUsersSince(msAgo) {
+  const cutoff = Date.now() - msAgo;
+  let count = 0;
+  for (const ts of metrics.lastSeenByUser.values()) {
+    if (ts >= cutoff) count += 1;
+  }
+  return count;
 }
 
 // =================== TELEGRAM API HELPERS ===================
@@ -69,15 +104,32 @@ async function tgSendChatAction(chatId, action = "typing") {
   return tgApi("sendChatAction", { chat_id: chatId, action });
 }
 
+async function tgAnswerCallbackQuery(callbackQueryId) {
+  return tgApi("answerCallbackQuery", { callback_query_id: callbackQueryId });
+}
+
+async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
+  if (WELCOME_IMAGE_URL) {
+    const res = await tgApi("sendPhoto", {
+      chat_id: chatId,
+      photo: WELCOME_IMAGE_URL,
+      caption,
+      reply_markup: { inline_keyboard: inlineKeyboard },
+    });
+    if (res) return res;
+  }
+  return tgSendMessage(chatId, caption, {
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  });
+}
+
 async function tgSendPhotoWithCaption(chatId, caption) {
   if (!WELCOME_IMAGE_URL) return tgSendMessage(chatId, caption);
-
   const res = await tgApi("sendPhoto", {
     chat_id: chatId,
     photo: WELCOME_IMAGE_URL,
     caption,
   });
-
   return res ? res : tgSendMessage(chatId, caption);
 }
 
@@ -135,7 +187,6 @@ function modeInstruction(mode) {
   ].join("\n");
 }
 
-// ⭐ Dit is de belangrijkste wijziging: “Telegram moet je Prompt-stijl blijven volgen”
 function promptStyleLockInstruction() {
   return [
     "The Prompt defines your identity and response style.",
@@ -198,63 +249,24 @@ function parseLanguage(text) {
   return null;
 }
 
-// =================== COPY / FLOWS ===================
-function menuText(lang) {
-  if (lang === "de") {
-    return [
-      "Menu",
-      "",
-      "1) Reflect  — ruhig & vertiefend",
-      "2) Clarity  — kurz & konkret",
-      "3) Breathe  — einfach & sanft",
-      "",
-      "Tippe: 1, 2 oder 3",
-      "",
-      "Commands:",
-      "/language  (Sprache ändern)",
-      "/menu      (Menü zeigen)",
-      "/reset     (alles zurücksetzen)"
-    ].join("\n");
-  }
-  if (lang === "en") {
-    return [
-      "Menu",
-      "",
-      "1) Reflect  — calm & deep",
-      "2) Clarity  — short & practical",
-      "3) Breathe  — simple & gentle",
-      "",
-      "Type: 1, 2 or 3",
-      "",
-      "Commands:",
-      "/language  (change language)",
-      "/menu      (show menu)",
-      "/reset     (reset everything)"
-    ].join("\n");
-  }
-  return [
-    "Menu",
-    "",
-    "1) Reflect  — rustig & verdiepend",
-    "2) Clarity  — kort & concreet",
-    "3) Breathe  — simpel & zacht",
-    "",
-    "Typ: 1, 2 of 3",
-    "",
-    "Commands:",
-    "/language  (taal wijzigen)",
-    "/menu      (menu tonen)",
-    "/reset     (alles resetten)"
-  ].join("\n");
+// =================== UI COPY ===================
+function menuCaption(lang) {
+  if (lang === "de") return "Schnellmenü — starte einfach zu schreiben.\n\nEinstellungen:";
+  if (lang === "en") return "Quick menu — you can start talking right away.\n\nSettings:";
+  return "Snelmenu — je kunt meteen beginnen met praten.\n\nInstellingen:";
+}
+
+function firstPromptAfterLang(lang) {
+  if (lang === "de") return "Alles klar. Du kannst jetzt einfach schreiben.\nTippe /menu für Einstellungen.";
+  if (lang === "en") return "Nice. You can start talking now.\nType /menu for settings.";
+  return "Top. Je kunt nu meteen praten.\nTyp /menu voor instellingen.";
 }
 
 async function askLanguageFlow(chatId) {
   const lines = [
     "Lothis is here.",
     "",
-    "Choose your voice.",
-    "",
-    "Type one of these:",
+    "Choose your voice:",
     "NL  (Nederlands)",
     "EN  (English)",
     "DE  (Deutsch)"
@@ -263,26 +275,101 @@ async function askLanguageFlow(chatId) {
   await tgSendPhotoWithCaption(chatId, lines);
 }
 
-async function setModeFromChoice(chatId, choice) {
+async function showQuickMenu(chatId) {
   const st = getState(chatId);
-  if (choice === "1") st.mode = "reflect";
-  if (choice === "2") st.mode = "clarity";
-  if (choice === "3") st.mode = "breathe";
-
   const lang = st.lang || "nl";
-  if (lang === "de") {
-    if (st.mode === "clarity") return "Clarity ist aktiv. Sag mir in einem Satz, was los ist.";
-    if (st.mode === "breathe") return "Breathe ist aktiv. Wo spürst du es gerade am stärksten?";
-    return "Reflect ist aktiv. Woran denkst du gerade am meisten?";
+
+  const inlineKeyboard = [
+    [
+      { text: "🪷 Reflect", callback_data: "set_mode:reflect" },
+      { text: "🔎 Clarity", callback_data: "set_mode:clarity" },
+      { text: "🌬️ Breathe", callback_data: "set_mode:breathe" }
+    ],
+    [
+      { text: "🌍 Language", callback_data: "choose_lang" },
+      { text: "↩️ Reset", callback_data: "reset" }
+    ],
+    [{ text: "✨ lothis.com", url: "https://lothis.com" }]
+  ];
+
+  await tgSendPhotoWithButtons(chatId, menuCaption(lang), inlineKeyboard);
+}
+
+async function showLanguagePickerInline(chatId) {
+  const inlineKeyboard = [
+    [{ text: "🇳🇱 Nederlands", callback_data: "set_lang:nl" }],
+    [{ text: "🇬🇧 English", callback_data: "set_lang:en" }],
+    [{ text: "🇩🇪 Deutsch", callback_data: "set_lang:de" }],
+  ];
+
+  await tgSendMessage(chatId, "Choose language / Kies taal / Sprache wählen:", {
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  });
+}
+
+// =================== CALLBACKS ===================
+async function handleCallback(update) {
+  const cb = update.callback_query;
+  if (!cb) return;
+
+  const chatId = cb.message?.chat?.id;
+  const data = cb.data;
+  if (!chatId || !data) return;
+
+  await tgAnswerCallbackQuery(cb.id).catch(() => {});
+  const st = getState(chatId);
+
+  if (data === "choose_lang") {
+    await showLanguagePickerInline(chatId);
+    return;
   }
-  if (lang === "en") {
-    if (st.mode === "clarity") return "Clarity is on. Tell me what’s going on in one sentence.";
-    if (st.mode === "breathe") return "Breathe is on. Where do you feel it most in your body right now?";
-    return "Reflect is on. What’s on your mind right now?";
+
+  if (data === "reset") {
+    resetState(chatId);
+    await tgSendMessage(chatId, "Reset klaar. Typ /start.");
+    return;
   }
-  if (st.mode === "clarity") return "Clarity staat aan. Kun je in één zin zeggen wat er speelt?";
-  if (st.mode === "breathe") return "Breathe staat aan. Waar voel je het nu het meest in je lichaam?";
-  return "Reflect staat aan. Waar zit je hoofd nu het meeste mee?";
+
+  if (data.startsWith("set_lang:")) {
+    st.lang = data.split(":")[1];
+    st.stage = "ready";
+    st.prevId = null;
+    await tgSendMessage(chatId, firstPromptAfterLang(st.lang));
+    return;
+  }
+
+  if (data.startsWith("set_mode:")) {
+    st.mode = data.split(":")[1];
+    // geen lange uitleg; gewoon bevestiging subtiel
+    await tgSendMessage(chatId, "✓");
+    return;
+  }
+}
+
+// =================== ADMIN: /stats ===================
+async function handleStats(chatId) {
+  if (!ADMIN_CHAT_ID || String(chatId) !== String(ADMIN_CHAT_ID)) {
+    await tgSendMessage(chatId, "Nope 🙂");
+    return;
+  }
+
+  const uptimeMin = Math.floor((Date.now() - metrics.startedAt) / 60000);
+  const dau = countActiveUsersSince(24 * 60 * 60 * 1000);
+  const wau = countActiveUsersSince(7 * 24 * 60 * 60 * 1000);
+
+  await tgSendMessage(
+    chatId,
+    [
+      "Lothis bot stats",
+      `Uptime: ${uptimeMin} min`,
+      `Unique users (since restart): ${metrics.uniqueUsers.size}`,
+      `Active users (24h): ${dau}`,
+      `Active users (7d): ${wau}`,
+      `Total updates: ${metrics.totalUpdates}`,
+      `Total messages: ${metrics.totalMessages}`,
+      `Starts: ${metrics.starts}`
+    ].join("\n")
+  );
 }
 
 // =================== WEBHOOK ===================
@@ -291,6 +378,13 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
   try {
     const update = req.body;
+
+    // callbacks (menu buttons)
+    if (update.callback_query) {
+      await handleCallback(update);
+      return;
+    }
+
     const msg = update.message || update.edited_message;
     if (!msg) return;
 
@@ -298,7 +392,16 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     const text = msg.text?.trim();
     if (!chatId) return;
 
+    // track
+    trackUpdate(chatId, Boolean(text), text);
+
     const st = getState(chatId);
+
+    // Admin
+    if (text === "/stats") {
+      await handleStats(chatId);
+      return;
+    }
 
     // Commands
     if (text === "/reset") {
@@ -308,20 +411,13 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     }
 
     if (text === "/start") {
-      // start altijd met taal als die er nog niet is
       if (!st.lang) {
         st.stage = "needs_lang";
         await askLanguageFlow(chatId);
       } else {
         st.stage = "ready";
-        await tgSendMessage(chatId, menuText(st.lang));
+        await tgSendMessage(chatId, "Je kunt meteen beginnen met praten.\nTyp /menu voor instellingen.");
       }
-      return;
-    }
-
-    if (text === "/language") {
-      st.stage = "needs_lang";
-      await askLanguageFlow(chatId);
       return;
     }
 
@@ -330,7 +426,17 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
         st.stage = "needs_lang";
         await askLanguageFlow(chatId);
       } else {
-        await tgSendMessage(chatId, menuText(st.lang));
+        await showQuickMenu(chatId);
+      }
+      return;
+    }
+
+    if (text === "/language") {
+      if (!st.lang) {
+        st.stage = "needs_lang";
+        await askLanguageFlow(chatId);
+      } else {
+        await showLanguagePickerInline(chatId);
       }
       return;
     }
@@ -341,7 +447,7 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
       return;
     }
 
-    // Language gate
+    // Language gate (tekst kiezen: NL/EN/DE)
     if (!st.lang || st.stage === "needs_lang") {
       const lang = parseLanguage(text);
       if (!lang) {
@@ -354,20 +460,11 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
       st.lang = lang;
       st.stage = "ready";
-      st.prevId = null; // nieuw “gesprek”-gevoel
+      st.prevId = null;
 
-      if (lang === "en") await tgSendMessage(chatId, "Nice. We’ll talk in English.");
-      if (lang === "de") await tgSendMessage(chatId, "Alles klar. Wir sprechen Deutsch.");
-      if (lang === "nl") await tgSendMessage(chatId, "Top. We praten Nederlands.");
-
-      await tgSendMessage(chatId, menuText(lang));
-      return;
-    }
-
-    // Menu choices (1/2/3)
-    if (text === "1" || text === "2" || text === "3") {
-      const msg2 = await setModeFromChoice(chatId, text);
-      await tgSendMessage(chatId, msg2);
+      await tgSendMessage(chatId, firstPromptAfterLang(lang));
+      // Optioneel: direct menu tonen? (kan, maar jij wilde snel praten)
+      // await showQuickMenu(chatId);
       return;
     }
 
@@ -380,13 +477,33 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
   }
 });
 
-// =================== HEALTH ===================
+// =================== HEALTH + METRICS ===================
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.get("/metrics", (req, res) => {
+  const token = req.headers["x-metrics-token"] || req.query.token || "";
+  if (!METRICS_TOKEN || String(token) !== String(METRICS_TOKEN)) {
+    return res.status(401).json({ ok: false });
+  }
+
+  const uptimeSec = Math.floor((Date.now() - metrics.startedAt) / 1000);
+
+  res.json({
+    ok: true,
+    uptimeSec,
+    uniqueUsers: metrics.uniqueUsers.size,
+    active24h: countActiveUsersSince(24 * 60 * 60 * 1000),
+    active7d: countActiveUsersSince(7 * 24 * 60 * 60 * 1000),
+    totalUpdates: metrics.totalUpdates,
+    totalMessages: metrics.totalMessages,
+    starts: metrics.starts,
+  });
+});
+
 app.get("/", (_req, res) => res.send("Lothis Telegram Bot is running ✨"));
 
 // =================== START ===================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Lothis Telegram Bot running on :${PORT}`);
-  if (PUBLIC_BASE_URL) console.log("Base:", PUBLIC_BASE_URL);
 });
