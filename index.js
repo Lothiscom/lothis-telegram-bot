@@ -27,19 +27,19 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 // =================== STATE (in-memory beta) ===================
-// stage: needs_lang | ready
-const stateByChat = new Map(); // chatId -> { prevId, lang, mode, stage }
+const stateByChat = new Map(); // chatId -> { prevId, lang, mode }
 
 function getState(chatId) {
   const key = String(chatId);
   if (!stateByChat.has(key)) {
-    stateByChat.set(key, { prevId: null, lang: null, mode: "reflect", stage: "needs_lang" });
+    // default taal = nl (pas aan als je en default wil)
+    stateByChat.set(key, { prevId: null, lang: "nl", mode: "reflect" });
   }
   return stateByChat.get(key);
 }
 
 function resetState(chatId) {
-  stateByChat.set(String(chatId), { prevId: null, lang: null, mode: "reflect", stage: "needs_lang" });
+  stateByChat.set(String(chatId), { prevId: null, lang: "nl", mode: "reflect" });
 }
 
 // =================== METRICS (in-memory) ===================
@@ -123,16 +123,6 @@ async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
   });
 }
 
-async function tgSendPhotoWithCaption(chatId, caption) {
-  if (!WELCOME_IMAGE_URL) return tgSendMessage(chatId, caption);
-  const res = await tgApi("sendPhoto", {
-    chat_id: chatId,
-    photo: WELCOME_IMAGE_URL,
-    caption,
-  });
-  return res ? res : tgSendMessage(chatId, caption);
-}
-
 // =================== OPENAI (Responses + Prompt) ===================
 const OPENAI_HEADERS = {
   Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -200,11 +190,11 @@ async function openaiRespond({ chatId, userText }) {
   const st = getState(chatId);
 
   const instructions = [
-    st.lang ? `Respond in language: ${st.lang}` : null,
+    `Respond in language: ${st.lang}`,
     promptStyleLockInstruction(),
     modeInstruction(st.mode),
     telegramFormattingInstruction(),
-  ].filter(Boolean).join("\n\n");
+  ].join("\n\n");
 
   const body = {
     model: OPENAI_MODEL,
@@ -230,81 +220,52 @@ async function openaiRespond({ chatId, userText }) {
   return extractOutputText(json);
 }
 
-// =================== LANGUAGE PARSING ===================
-function normalize(s) {
-  return String(s || "").trim().toLowerCase();
-}
-
-function parseLanguage(text) {
-  const x = normalize(text);
-
-  if (x === "nl" || x === "nederlands" || x === "dutch" || x.includes("neder")) return "nl";
-  if (x === "en" || x === "english" || x === "engels" || x.includes("engl")) return "en";
-  if (x === "de" || x === "deutsch" || x === "duits" || x.includes("deut")) return "de";
-
-  if (x.includes("🇳🇱")) return "nl";
-  if (x.includes("🇬🇧") || x.includes("🇺🇸")) return "en";
-  if (x.includes("🇩🇪")) return "de";
-
-  return null;
-}
-
-// =================== UI COPY ===================
+// =================== UI (internal menu buttons) ===================
 function menuCaption(lang) {
-  if (lang === "de") return "Schnellmenü — starte einfach zu schreiben.\n\nEinstellungen:";
-  if (lang === "en") return "Quick menu — you can start talking right away.\n\nSettings:";
-  return "Snelmenu — je kunt meteen beginnen met praten.\n\nInstellingen:";
+  if (lang === "de") return "Schnell starten: schreib einfach.\n\nEinstellungen:";
+  if (lang === "en") return "Start instantly: just type.\n\nSettings:";
+  return "Start direct: typ gewoon.\n\nInstellingen:";
 }
 
-function firstPromptAfterLang(lang) {
-  if (lang === "de") return "Alles klar. Du kannst jetzt einfach schreiben.\nTippe /menu für Einstellungen.";
-  if (lang === "en") return "Nice. You can start talking now.\nType /menu for settings.";
-  return "Top. Je kunt nu meteen praten.\nTyp /menu voor instellingen.";
+function setLangConfirm(lang) {
+  if (lang === "de") return "Taal: Deutsch ✓";
+  if (lang === "en") return "Language: English ✓";
+  return "Taal: Nederlands ✓";
 }
 
-async function askLanguageFlow(chatId) {
-  const lines = [
-    "Lothis is here.",
-    "",
-    "Choose your voice:",
-    "NL  (Nederlands)",
-    "EN  (English)",
-    "DE  (Deutsch)"
-  ].join("\n");
-
-  await tgSendPhotoWithCaption(chatId, lines);
+function setModeConfirm(mode, lang) {
+  const l = lang || "nl";
+  const label =
+    mode === "clarity" ? (l === "nl" ? "Clarity" : "Clarity") :
+    mode === "breathe" ? (l === "nl" ? "Breathe" : "Breathe") :
+    (l === "nl" ? "Reflect" : "Reflect");
+  return (l === "de")
+    ? `Modus: ${label} ✓`
+    : (l === "en")
+    ? `Mode: ${label} ✓`
+    : `Modus: ${label} ✓`;
 }
 
-async function showQuickMenu(chatId) {
+async function showInternalMenu(chatId) {
   const st = getState(chatId);
-  const lang = st.lang || "nl";
-
   const inlineKeyboard = [
     [
       { text: "🪷 Reflect", callback_data: "set_mode:reflect" },
       { text: "🔎 Clarity", callback_data: "set_mode:clarity" },
-      { text: "🌬️ Breathe", callback_data: "set_mode:breathe" }
+      { text: "🌬️ Breathe", callback_data: "set_mode:breathe" },
     ],
     [
-      { text: "🌍 Language", callback_data: "choose_lang" },
-      { text: "↩️ Reset", callback_data: "reset" }
+      { text: "🇳🇱 NL", callback_data: "set_lang:nl" },
+      { text: "🇬🇧 EN", callback_data: "set_lang:en" },
+      { text: "🇩🇪 DE", callback_data: "set_lang:de" },
     ],
-    [{ text: "✨ lothis.com", url: "https://lothis.com" }]
+    [
+      { text: "↩️ Reset", callback_data: "reset" },
+      { text: "✨ lothis.com", url: "https://lothis.com" },
+    ],
   ];
 
-  await tgSendPhotoWithButtons(chatId, menuCaption(lang), inlineKeyboard);
-}
-
-async function showLanguagePickerInline(chatId) {
-  const inlineKeyboard = [
-    [{ text: "🇳🇱 Nederlands", callback_data: "set_lang:nl" }],
-    [{ text: "🇬🇧 English", callback_data: "set_lang:en" }],
-    [{ text: "🇩🇪 Deutsch", callback_data: "set_lang:de" }],
-  ];
-
-  await tgSendMessage(chatId, "Choose language / Kies taal / Sprache wählen:", {
-    reply_markup: { inline_keyboard: inlineKeyboard },
-  });
+  await tgSendPhotoWithButtons(chatId, menuCaption(st.lang), inlineKeyboard);
 }
 
 // =================== CALLBACKS ===================
@@ -319,29 +280,22 @@ async function handleCallback(update) {
   await tgAnswerCallbackQuery(cb.id).catch(() => {});
   const st = getState(chatId);
 
-  if (data === "choose_lang") {
-    await showLanguagePickerInline(chatId);
-    return;
-  }
-
   if (data === "reset") {
     resetState(chatId);
-    await tgSendMessage(chatId, "Reset klaar. Typ /start.");
+    await tgSendMessage(chatId, "Reset klaar. Typ gewoon verder of /menu.");
     return;
   }
 
   if (data.startsWith("set_lang:")) {
     st.lang = data.split(":")[1];
-    st.stage = "ready";
-    st.prevId = null;
-    await tgSendMessage(chatId, firstPromptAfterLang(st.lang));
+    st.prevId = null; // “frisse” context na taalwissel
+    await tgSendMessage(chatId, setLangConfirm(st.lang));
     return;
   }
 
   if (data.startsWith("set_mode:")) {
     st.mode = data.split(":")[1];
-    // geen lange uitleg; gewoon bevestiging subtiel
-    await tgSendMessage(chatId, "✓");
+    await tgSendMessage(chatId, setModeConfirm(st.mode, st.lang));
     return;
   }
 }
@@ -367,7 +321,7 @@ async function handleStats(chatId) {
       `Active users (7d): ${wau}`,
       `Total updates: ${metrics.totalUpdates}`,
       `Total messages: ${metrics.totalMessages}`,
-      `Starts: ${metrics.starts}`
+      `Starts: ${metrics.starts}`,
     ].join("\n")
   );
 }
@@ -395,8 +349,6 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     // track
     trackUpdate(chatId, Boolean(text), text);
 
-    const st = getState(chatId);
-
     // Admin
     if (text === "/stats") {
       await handleStats(chatId);
@@ -404,67 +356,25 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     }
 
     // Commands
-    if (text === "/reset") {
-      resetState(chatId);
-      await tgSendMessage(chatId, "Reset klaar. Typ /start.");
-      return;
-    }
-
     if (text === "/start") {
-      if (!st.lang) {
-        st.stage = "needs_lang";
-        await askLanguageFlow(chatId);
-      } else {
-        st.stage = "ready";
-        await tgSendMessage(chatId, "Je kunt meteen beginnen met praten.\nTyp /menu voor instellingen.");
-      }
+      await tgSendMessage(chatId, "Ik ben er. Typ gewoon wat er speelt.\n(/menu voor instellingen)");
       return;
     }
 
     if (text === "/menu") {
-      if (!st.lang) {
-        st.stage = "needs_lang";
-        await askLanguageFlow(chatId);
-      } else {
-        await showQuickMenu(chatId);
-      }
+      await showInternalMenu(chatId);
       return;
     }
 
-    if (text === "/language") {
-      if (!st.lang) {
-        st.stage = "needs_lang";
-        await askLanguageFlow(chatId);
-      } else {
-        await showLanguagePickerInline(chatId);
-      }
+    if (text === "/reset") {
+      resetState(chatId);
+      await tgSendMessage(chatId, "Reset klaar. Typ gewoon verder of /menu.");
       return;
     }
 
     // Non-text
     if (!text) {
       await tgSendMessage(chatId, "Stuur het even als tekst, dan pak ik ’m meteen.");
-      return;
-    }
-
-    // Language gate (tekst kiezen: NL/EN/DE)
-    if (!st.lang || st.stage === "needs_lang") {
-      const lang = parseLanguage(text);
-      if (!lang) {
-        await tgSendMessage(
-          chatId,
-          "Kies eerst even een taal: typ NL, EN of DE.\n(Je mag ook ‘Nederlands/English/Deutsch’ typen.)"
-        );
-        return;
-      }
-
-      st.lang = lang;
-      st.stage = "ready";
-      st.prevId = null;
-
-      await tgSendMessage(chatId, firstPromptAfterLang(lang));
-      // Optioneel: direct menu tonen? (kan, maar jij wilde snel praten)
-      // await showQuickMenu(chatId);
       return;
     }
 
