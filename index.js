@@ -4,21 +4,29 @@ import fetch from "node-fetch";
 // =================== ENV ===================
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_PROMPT_ID = process.env.OPENAI_PROMPT_ID; // pmpt_...
+
+const OPENAI_FREE_PROMPT_ID = process.env.OPENAI_FREE_PROMPT_ID;
+const OPENAI_PREMIUM_PROMPT_ID = process.env.OPENAI_PREMIUM_PROMPT_ID;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
 const WELCOME_IMAGE_URL =
   process.env.WELCOME_IMAGE_URL ||
   "https://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg";
 
-// Metrics/Admin
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || ""; // jouw Telegram chat_id (string)
-const METRICS_TOKEN = process.env.METRICS_TOKEN || ""; // random secret voor /metrics
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || "";
+const METRICS_TOKEN = process.env.METRICS_TOKEN || "";
 
-if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_PROMPT_ID || !WEBHOOK_SECRET) {
+if (
+  !TELEGRAM_TOKEN ||
+  !OPENAI_API_KEY ||
+  !OPENAI_FREE_PROMPT_ID ||
+  !OPENAI_PREMIUM_PROMPT_ID ||
+  !WEBHOOK_SECRET
+) {
   console.error(
-    "Missing env vars. Need TELEGRAM_TOKEN, OPENAI_API_KEY, OPENAI_PROMPT_ID, WEBHOOK_SECRET"
+    "Missing env vars. Need TELEGRAM_TOKEN, OPENAI_API_KEY, OPENAI_FREE_PROMPT_ID, OPENAI_PREMIUM_PROMPT_ID, WEBHOOK_SECRET"
   );
   process.exit(1);
 }
@@ -26,13 +34,12 @@ if (!TELEGRAM_TOKEN || !OPENAI_API_KEY || !OPENAI_PROMPT_ID || !WEBHOOK_SECRET) 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// =================== STATE (in-memory beta) ===================
-const stateByChat = new Map(); // chatId -> { prevId, lang, mode }
+// =================== STATE ===================
+const stateByChat = new Map();
 
 function getState(chatId) {
   const key = String(chatId);
   if (!stateByChat.has(key)) {
-    // default taal = nl (pas aan als je en default wil)
     stateByChat.set(key, { prevId: null, lang: "nl", mode: "reflect" });
   }
   return stateByChat.get(key);
@@ -42,7 +49,21 @@ function resetState(chatId) {
   stateByChat.set(String(chatId), { prevId: null, lang: "nl", mode: "reflect" });
 }
 
-// =================== METRICS (in-memory) ===================
+// =================== PREMIUM SWITCH ===================
+// Nu nog altijd false.
+// Later vervangen door database / payment check.
+function isPremium(chatId) {
+  void chatId;
+  return false;
+}
+
+function getPromptIdForUser(chatId) {
+  return isPremium(chatId)
+    ? OPENAI_PREMIUM_PROMPT_ID
+    : OPENAI_FREE_PROMPT_ID;
+}
+
+// =================== METRICS ===================
 const metrics = {
   startedAt: Date.now(),
   totalUpdates: 0,
@@ -74,10 +95,9 @@ function countActiveUsersSince(msAgo) {
   return count;
 }
 
-// =================== TELEGRAM API HELPERS ===================
+// =================== TELEGRAM ===================
 async function tgApi(method, body) {
-  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`;
-  const res = await fetch(url, {
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -88,6 +108,7 @@ async function tgApi(method, body) {
     console.error(`Telegram ${method} failed:`, res.status, t);
     return null;
   }
+
   return res.json().catch(() => null);
 }
 
@@ -101,11 +122,16 @@ async function tgSendMessage(chatId, text, extra = {}) {
 }
 
 async function tgSendChatAction(chatId, action = "typing") {
-  return tgApi("sendChatAction", { chat_id: chatId, action });
+  return tgApi("sendChatAction", {
+    chat_id: chatId,
+    action,
+  });
 }
 
 async function tgAnswerCallbackQuery(callbackQueryId) {
-  return tgApi("answerCallbackQuery", { callback_query_id: callbackQueryId });
+  return tgApi("answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+  });
 }
 
 async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
@@ -116,23 +142,29 @@ async function tgSendPhotoWithButtons(chatId, caption, inlineKeyboard) {
       caption,
       reply_markup: { inline_keyboard: inlineKeyboard },
     });
+
     if (res) return res;
   }
+
   return tgSendMessage(chatId, caption, {
     reply_markup: { inline_keyboard: inlineKeyboard },
   });
 }
 
-// =================== OPENAI (Responses + Prompt) ===================
+// =================== OPENAI ===================
 const OPENAI_HEADERS = {
   Authorization: `Bearer ${OPENAI_API_KEY}`,
   "Content-Type": "application/json",
 };
 
 function extractOutputText(json) {
-  if (typeof json?.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
+  if (typeof json?.output_text === "string" && json.output_text.trim()) {
+    return json.output_text.trim();
+  }
+
   let out = "";
   const output = json?.output || [];
+
   for (const item of output) {
     const content = item?.content || [];
     for (const c of content) {
@@ -141,6 +173,7 @@ function extractOutputText(json) {
       if (c?.type === "text" && c?.text?.value) out += c.text.value;
     }
   }
+
   return out.trim();
 }
 
@@ -162,6 +195,7 @@ function modeInstruction(mode) {
       "Prefer 3–5 short steps."
     ].join("\n");
   }
+
   if (mode === "breathe") {
     return [
       "Mode: BREATHE.",
@@ -169,6 +203,7 @@ function modeInstruction(mode) {
       "Use short, soothing sentences."
     ].join("\n");
   }
+
   return [
     "Mode: REFLECT.",
     "Be calm, present, and thoughtful.",
@@ -198,7 +233,7 @@ async function openaiRespond({ chatId, userText }) {
 
   const body = {
     model: OPENAI_MODEL,
-    prompt: { id: OPENAI_PROMPT_ID },
+    prompt: { id: getPromptIdForUser(chatId) },
     input: [{ role: "user", content: userText }],
     previous_response_id: st.prevId || undefined,
     instructions,
@@ -220,7 +255,7 @@ async function openaiRespond({ chatId, userText }) {
   return extractOutputText(json);
 }
 
-// =================== UI (internal menu buttons) ===================
+// =================== MENU ===================
 function menuCaption(lang) {
   if (lang === "de") return "Schnell starten: schreib einfach.\n\nEinstellungen:";
   if (lang === "en") return "Start instantly: just type.\n\nSettings:";
@@ -235,19 +270,22 @@ function setLangConfirm(lang) {
 
 function setModeConfirm(mode, lang) {
   const l = lang || "nl";
+
   const label =
-    mode === "clarity" ? (l === "nl" ? "Clarity" : "Clarity") :
-    mode === "breathe" ? (l === "nl" ? "Breathe" : "Breathe") :
-    (l === "nl" ? "Reflect" : "Reflect");
-  return (l === "de")
-    ? `Modus: ${label} ✓`
-    : (l === "en")
-    ? `Mode: ${label} ✓`
-    : `Modus: ${label} ✓`;
+    mode === "clarity"
+      ? "Clarity"
+      : mode === "breathe"
+        ? "Breathe"
+        : "Reflect";
+
+  if (l === "de") return `Modus: ${label} ✓`;
+  if (l === "en") return `Mode: ${label} ✓`;
+  return `Modus: ${label} ✓`;
 }
 
 async function showInternalMenu(chatId) {
   const st = getState(chatId);
+
   const inlineKeyboard = [
     [
       { text: "🪷 Reflect", callback_data: "set_mode:reflect" },
@@ -288,7 +326,7 @@ async function handleCallback(update) {
 
   if (data.startsWith("set_lang:")) {
     st.lang = data.split(":")[1];
-    st.prevId = null; // “frisse” context na taalwissel
+    st.prevId = null;
     await tgSendMessage(chatId, setLangConfirm(st.lang));
     return;
   }
@@ -300,7 +338,7 @@ async function handleCallback(update) {
   }
 }
 
-// =================== ADMIN: /stats ===================
+// =================== ADMIN ===================
 async function handleStats(chatId) {
   if (!ADMIN_CHAT_ID || String(chatId) !== String(ADMIN_CHAT_ID)) {
     await tgSendMessage(chatId, "Nope 🙂");
@@ -333,7 +371,6 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
   try {
     const update = req.body;
 
-    // callbacks (menu buttons)
     if (update.callback_query) {
       await handleCallback(update);
       return;
@@ -344,18 +381,16 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
 
     const chatId = msg.chat?.id;
     const text = msg.text?.trim();
+
     if (!chatId) return;
 
-    // track
     trackUpdate(chatId, Boolean(text), text);
 
-    // Admin
     if (text === "/stats") {
       await handleStats(chatId);
       return;
     }
 
-    // Commands
     if (text === "/start") {
       await tgSendMessage(chatId, "Ik ben er. Typ gewoon wat er speelt.\n(/menu voor instellingen)");
       return;
@@ -372,14 +407,13 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
       return;
     }
 
-    // Non-text
     if (!text) {
       await tgSendMessage(chatId, "Stuur het even als tekst, dan pak ik ’m meteen.");
       return;
     }
 
-    // Normal message -> OpenAI
     tgSendChatAction(chatId, "typing").catch(() => {});
+
     const reply = await openaiRespond({ chatId, userText: text });
     await tgSendMessage(chatId, reply || "…");
   } catch (e) {
@@ -387,11 +421,12 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
   }
 });
 
-// =================== HEALTH + METRICS ===================
+// =================== HEALTH ===================
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/metrics", (req, res) => {
   const token = req.headers["x-metrics-token"] || req.query.token || "";
+
   if (!METRICS_TOKEN || String(token) !== String(METRICS_TOKEN)) {
     return res.status(401).json({ ok: false });
   }
