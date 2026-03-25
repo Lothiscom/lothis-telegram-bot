@@ -13,7 +13,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
 const WELCOME_IMAGE_URL =
   process.env.WELCOME_IMAGE_URL ||
-  "https://lothis.com/wp-content/uploads/2025/12/lotus-tg-animation.jpg";
+  "https://lothis.com/wp-content/uploads/2026/02/cropped-Lothis-app-icon-transparent.png";
 
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || "";
 const METRICS_TOKEN = process.env.METRICS_TOKEN || "";
@@ -50,8 +50,8 @@ function resetState(chatId) {
 }
 
 // =================== PREMIUM SWITCH ===================
-// Nu nog altijd false.
-// Later vervangen door database / payment check.
+// Tijdelijk altijd false.
+// Later vervangen door echte check via database / payment status.
 function isPremium(chatId) {
   void chatId;
   return false;
@@ -216,8 +216,8 @@ function promptStyleLockInstruction() {
   return [
     "The Prompt defines your identity and response style.",
     "Stay with emotional presence, reflection, and meaning-making.",
-    "Do NOT switch to generic advice, safety checklists, or external help suggestions unless the Prompt explicitly asks for it.",
-    "If a situation sounds severe, reflect the emotional impact and ask a grounding question instead of offering solutions."
+    "Do NOT switch to generic advice or checklist-style answers unless the Prompt explicitly asks for it.",
+    "If a situation sounds severe, reflect the emotional impact before moving to suggestions."
   ].join("\n");
 }
 
