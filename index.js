@@ -4,11 +4,9 @@ import fetch from "node-fetch";
 // =================== ENV ===================
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
 const OPENAI_FREE_PROMPT_ID = process.env.OPENAI_FREE_PROMPT_ID;
 const OPENAI_PREMIUM_PROMPT_ID = process.env.OPENAI_PREMIUM_PROMPT_ID;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
-
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-me";
 
 const WELCOME_IMAGE_URL =
@@ -17,6 +15,20 @@ const WELCOME_IMAGE_URL =
 
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || "";
 const METRICS_TOKEN = process.env.METRICS_TOKEN || "";
+
+/**
+ * Comma-separated chat ids that should use premium.
+ * Example:
+ * PREMIUM_CHAT_IDS=123456789,987654321
+ */
+const PREMIUM_CHAT_IDS = new Set(
+  String(process.env.PREMIUM_CHAT_IDS || "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean)
+);
+
+const PREMIUM_URL = process.env.PREMIUM_URL || "https://lothis.com/premium";
 
 if (
   !TELEGRAM_TOKEN ||
@@ -50,17 +62,34 @@ function resetState(chatId) {
 }
 
 // =================== PREMIUM SWITCH ===================
-// Tijdelijk altijd false.
-// Later vervangen door echte check via database / payment status.
 function isPremium(chatId) {
-  void chatId;
-  return false;
+  return PREMIUM_CHAT_IDS.has(String(chatId));
 }
 
 function getPromptIdForUser(chatId) {
   return isPremium(chatId)
     ? OPENAI_PREMIUM_PROMPT_ID
     : OPENAI_FREE_PROMPT_ID;
+}
+
+function premiumStatusText(chatId, lang = "nl") {
+  const premium = isPremium(chatId);
+
+  if (lang === "en") {
+    return premium
+      ? "Status: Premium ✓"
+      : `Status: Free\nUpgrade: ${PREMIUM_URL}`;
+  }
+
+  if (lang === "de") {
+    return premium
+      ? "Status: Premium ✓"
+      : `Status: Free\nUpgrade: ${PREMIUM_URL}`;
+  }
+
+  return premium
+    ? "Status: Premium ✓"
+    : `Status: Free\nUpgrade: ${PREMIUM_URL}`;
 }
 
 // =================== METRICS ===================
@@ -89,9 +118,11 @@ function trackUpdate(chatId, hasText, textValue) {
 function countActiveUsersSince(msAgo) {
   const cutoff = Date.now() - msAgo;
   let count = 0;
+
   for (const ts of metrics.lastSeenByUser.values()) {
     if (ts >= cutoff) count += 1;
   }
+
   return count;
 }
 
@@ -298,8 +329,12 @@ async function showInternalMenu(chatId) {
       { text: "🇩🇪 DE", callback_data: "set_lang:de" },
     ],
     [
-      { text: "↩️ Reset", callback_data: "reset" },
+      { text: "💎 Premium", url: PREMIUM_URL },
       { text: "✨ lothis.com", url: "https://lothis.com" },
+    ],
+    [
+      { text: "↩️ Reset", callback_data: "reset" },
+      { text: "📌 Status", callback_data: "check_status" },
     ],
   ];
 
@@ -321,6 +356,11 @@ async function handleCallback(update) {
   if (data === "reset") {
     resetState(chatId);
     await tgSendMessage(chatId, "Reset klaar. Typ gewoon verder of /menu.");
+    return;
+  }
+
+  if (data === "check_status") {
+    await tgSendMessage(chatId, premiumStatusText(chatId, st.lang));
     return;
   }
 
@@ -360,7 +400,36 @@ async function handleStats(chatId) {
       `Total updates: ${metrics.totalUpdates}`,
       `Total messages: ${metrics.totalMessages}`,
       `Starts: ${metrics.starts}`,
+      `Premium ids loaded: ${PREMIUM_CHAT_IDS.size}`,
     ].join("\n")
+  );
+}
+
+// =================== COMMAND HELPERS ===================
+async function handleStart(chatId) {
+  const premium = isPremium(chatId);
+
+  const text = premium
+    ? "Welkom terug.\nJe gebruikt nu Lothis Premium.\n\nTyp gewoon wat er speelt.\n(/menu voor instellingen)"
+    : "Ik ben er. Typ gewoon wat er speelt.\n\nJe start nu in de gratis versie.\n(/menu voor instellingen)";
+
+  await tgSendMessage(chatId, text, {
+    reply_markup: {
+      inline_keyboard: premium
+        ? [[{ text: "✨ Menu", callback_data: "check_status" }]]
+        : [[{ text: "💎 Bekijk Premium", url: PREMIUM_URL }]],
+    },
+  });
+}
+
+async function handlePremium(chatId) {
+  await tgSendMessage(chatId, premiumStatusText(chatId));
+}
+
+async function handleWhoAmI(chatId) {
+  await tgSendMessage(
+    chatId,
+    `Jouw Telegram chat_id is:\n${chatId}\n\nGebruik dit later om premium te koppelen.`
   );
 }
 
@@ -392,7 +461,7 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     }
 
     if (text === "/start") {
-      await tgSendMessage(chatId, "Ik ben er. Typ gewoon wat er speelt.\n(/menu voor instellingen)");
+      await handleStart(chatId);
       return;
     }
 
@@ -407,6 +476,16 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
       return;
     }
 
+    if (text === "/premium") {
+      await handlePremium(chatId);
+      return;
+    }
+
+    if (text === "/whoami") {
+      await handleWhoAmI(chatId);
+      return;
+    }
+
     if (!text) {
       await tgSendMessage(chatId, "Stuur het even als tekst, dan pak ik ’m meteen.");
       return;
@@ -418,6 +497,17 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     await tgSendMessage(chatId, reply || "…");
   } catch (e) {
     console.error("Webhook error:", e);
+    const chatId =
+      req.body?.message?.chat?.id ||
+      req.body?.edited_message?.chat?.id ||
+      req.body?.callback_query?.message?.chat?.id;
+
+    if (chatId) {
+      await tgSendMessage(
+        chatId,
+        "Er ging iets mis. Probeer het over een paar seconden nog eens."
+      ).catch(() => {});
+    }
   }
 });
 
@@ -442,6 +532,7 @@ app.get("/metrics", (req, res) => {
     totalUpdates: metrics.totalUpdates,
     totalMessages: metrics.totalMessages,
     starts: metrics.starts,
+    premiumIdsLoaded: PREMIUM_CHAT_IDS.size,
   });
 });
 
