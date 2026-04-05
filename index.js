@@ -232,7 +232,6 @@ async function openaiRespond({ chatId, userText }) {
 
   const instructions = [
     `Respond in language: ${st.lang}`,
-    "Mode: REFLECT.",
     "Be calm, present, and thoughtful.",
     "Respond with enough depth to feel supportive.",
     "Ask one warm question that moves the conversation forward.",
