@@ -15,9 +15,10 @@ const WELCOME_IMAGE_URL =
 
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || "";
 const METRICS_TOKEN = process.env.METRICS_TOKEN || "";
+const PREMIUM_URL = process.env.PREMIUM_URL || "https://lothis.com/premium";
 
 /**
- * Comma-separated chat ids that should use premium.
+ * Comma-separated premium chat ids
  * Example:
  * PREMIUM_CHAT_IDS=123456789,987654321
  */
@@ -27,8 +28,6 @@ const PREMIUM_CHAT_IDS = new Set(
     .map((v) => v.trim())
     .filter(Boolean)
 );
-
-const PREMIUM_URL = process.env.PREMIUM_URL || "https://lothis.com/premium";
 
 if (
   !TELEGRAM_TOKEN ||
@@ -52,16 +51,16 @@ const stateByChat = new Map();
 function getState(chatId) {
   const key = String(chatId);
   if (!stateByChat.has(key)) {
-    stateByChat.set(key, { prevId: null, lang: "nl", mode: "reflect" });
+    stateByChat.set(key, { prevId: null, lang: "nl" });
   }
   return stateByChat.get(key);
 }
 
 function resetState(chatId) {
-  stateByChat.set(String(chatId), { prevId: null, lang: "nl", mode: "reflect" });
+  stateByChat.set(String(chatId), { prevId: null, lang: "nl" });
 }
 
-// =================== PREMIUM SWITCH ===================
+// =================== PREMIUM ===================
 function isPremium(chatId) {
   return PREMIUM_CHAT_IDS.has(String(chatId));
 }
@@ -128,7 +127,9 @@ function countActiveUsersSince(msAgo) {
 
 // =================== TELEGRAM ===================
 async function tgApi(method, body) {
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`, {
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`;
+
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -217,32 +218,6 @@ function telegramFormattingInstruction() {
   ].join("\n");
 }
 
-function modeInstruction(mode) {
-  if (mode === "clarity") {
-    return [
-      "Mode: CLARITY.",
-      "Be concise and practical.",
-      "Ask at most one clarifying question.",
-      "Prefer 3–5 short steps."
-    ].join("\n");
-  }
-
-  if (mode === "breathe") {
-    return [
-      "Mode: BREATHE.",
-      "Keep it very gentle and simple.",
-      "Use short, soothing sentences."
-    ].join("\n");
-  }
-
-  return [
-    "Mode: REFLECT.",
-    "Be calm, present, and thoughtful.",
-    "Respond with enough depth to feel supportive.",
-    "Ask one warm question that moves the conversation forward."
-  ].join("\n");
-}
-
 function promptStyleLockInstruction() {
   return [
     "The Prompt defines your identity and response style.",
@@ -257,8 +232,11 @@ async function openaiRespond({ chatId, userText }) {
 
   const instructions = [
     `Respond in language: ${st.lang}`,
+    "Mode: REFLECT.",
+    "Be calm, present, and thoughtful.",
+    "Respond with enough depth to feel supportive.",
+    "Ask one warm question that moves the conversation forward.",
     promptStyleLockInstruction(),
-    modeInstruction(st.mode),
     telegramFormattingInstruction(),
   ].join("\n\n");
 
@@ -299,30 +277,10 @@ function setLangConfirm(lang) {
   return "Taal: Nederlands ✓";
 }
 
-function setModeConfirm(mode, lang) {
-  const l = lang || "nl";
-
-  const label =
-    mode === "clarity"
-      ? "Clarity"
-      : mode === "breathe"
-        ? "Breathe"
-        : "Reflect";
-
-  if (l === "de") return `Modus: ${label} ✓`;
-  if (l === "en") return `Mode: ${label} ✓`;
-  return `Modus: ${label} ✓`;
-}
-
 async function showInternalMenu(chatId) {
   const st = getState(chatId);
 
   const inlineKeyboard = [
-    [
-      { text: "🪷 Reflect", callback_data: "set_mode:reflect" },
-      { text: "🔎 Clarity", callback_data: "set_mode:clarity" },
-      { text: "🌬️ Breathe", callback_data: "set_mode:breathe" },
-    ],
     [
       { text: "🇳🇱 NL", callback_data: "set_lang:nl" },
       { text: "🇬🇧 EN", callback_data: "set_lang:en" },
@@ -348,6 +306,7 @@ async function handleCallback(update) {
 
   const chatId = cb.message?.chat?.id;
   const data = cb.data;
+
   if (!chatId || !data) return;
 
   await tgAnswerCallbackQuery(cb.id).catch(() => {});
@@ -368,12 +327,6 @@ async function handleCallback(update) {
     st.lang = data.split(":")[1];
     st.prevId = null;
     await tgSendMessage(chatId, setLangConfirm(st.lang));
-    return;
-  }
-
-  if (data.startsWith("set_mode:")) {
-    st.mode = data.split(":")[1];
-    await tgSendMessage(chatId, setModeConfirm(st.mode, st.lang));
     return;
   }
 }
@@ -416,7 +369,7 @@ async function handleStart(chatId) {
   await tgSendMessage(chatId, text, {
     reply_markup: {
       inline_keyboard: premium
-        ? [[{ text: "✨ Menu", callback_data: "check_status" }]]
+        ? [[{ text: "📌 Bekijk status", callback_data: "check_status" }]]
         : [[{ text: "💎 Bekijk Premium", url: PREMIUM_URL }]],
     },
   });
@@ -497,6 +450,7 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     await tgSendMessage(chatId, reply || "…");
   } catch (e) {
     console.error("Webhook error:", e);
+
     const chatId =
       req.body?.message?.chat?.id ||
       req.body?.edited_message?.chat?.id ||
