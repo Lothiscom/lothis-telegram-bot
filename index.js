@@ -18,14 +18,26 @@ const METRICS_TOKEN = process.env.METRICS_TOKEN || "";
 const PREMIUM_URL = process.env.PREMIUM_URL || "https://lothis.com/premium";
 
 /**
- * Comma-separated premium chat ids
+ * Optional: hardcoded premium chat ids via env
  * Example:
  * PREMIUM_CHAT_IDS=123456789,987654321
  */
-const PREMIUM_CHAT_IDS = new Set(
+const PRELOADED_PREMIUM_CHAT_IDS = new Set(
   String(process.env.PREMIUM_CHAT_IDS || "")
     .split(",")
     .map((v) => v.trim())
+    .filter(Boolean)
+);
+
+/**
+ * Test / activation codes via env
+ * Example:
+ * ACTIVATION_CODES=LTHS-7Q2M-9KXA,LTHS-4P8D-WR31,LTHS-Z6NV-2TLM
+ */
+const ACTIVATION_CODES = new Set(
+  String(process.env.ACTIVATION_CODES || "")
+    .split(",")
+    .map((v) => v.trim().toUpperCase())
     .filter(Boolean)
 );
 
@@ -47,22 +59,36 @@ app.use(express.json({ limit: "1mb" }));
 
 // =================== STATE ===================
 const stateByChat = new Map();
-
+// chatId -> { prevId, lang, awaitingCode }
 function getState(chatId) {
   const key = String(chatId);
   if (!stateByChat.has(key)) {
-    stateByChat.set(key, { prevId: null, lang: "nl" });
+    stateByChat.set(key, {
+      prevId: null,
+      lang: "nl",
+      awaitingCode: false,
+    });
   }
   return stateByChat.get(key);
 }
 
 function resetState(chatId) {
-  stateByChat.set(String(chatId), { prevId: null, lang: "nl" });
+  stateByChat.set(String(chatId), {
+    prevId: null,
+    lang: "nl",
+    awaitingCode: false,
+  });
 }
 
 // =================== PREMIUM ===================
+const activatedPremiumChatIds = new Set([...PRELOADED_PREMIUM_CHAT_IDS]);
+
 function isPremium(chatId) {
-  return PREMIUM_CHAT_IDS.has(String(chatId));
+  return activatedPremiumChatIds.has(String(chatId));
+}
+
+function activatePremium(chatId) {
+  activatedPremiumChatIds.add(String(chatId));
 }
 
 function getPromptIdForUser(chatId) {
@@ -77,18 +103,32 @@ function premiumStatusText(chatId, lang = "nl") {
   if (lang === "en") {
     return premium
       ? "Status: Premium ✓"
-      : `Status: Free\nUpgrade: ${PREMIUM_URL}`;
+      : `Status: Free\nUpgrade: ${PREMIUM_URL}\nOr use /code if you have an activation code.`;
   }
 
   if (lang === "de") {
     return premium
       ? "Status: Premium ✓"
-      : `Status: Free\nUpgrade: ${PREMIUM_URL}`;
+      : `Status: Free\nUpgrade: ${PREMIUM_URL}\nOder nutze /code, wenn du einen Aktivierungscode hast.`;
   }
 
   return premium
     ? "Status: Premium ✓"
-    : `Status: Free\nUpgrade: ${PREMIUM_URL}`;
+    : `Status: Free\nUpgrade: ${PREMIUM_URL}\nOf gebruik /code als je een activatiecode hebt.`;
+}
+
+function normalizeCode(input) {
+  return String(input || "").trim().toUpperCase();
+}
+
+function consumeActivationCode(rawCode) {
+  const code = normalizeCode(rawCode);
+
+  if (!code) return { ok: false, reason: "empty" };
+  if (!ACTIVATION_CODES.has(code)) return { ok: false, reason: "invalid" };
+
+  ACTIVATION_CODES.delete(code);
+  return { ok: true, code };
 }
 
 // =================== METRICS ===================
@@ -99,6 +139,7 @@ const metrics = {
   uniqueUsers: new Set(),
   lastSeenByUser: new Map(),
   starts: 0,
+  codeActivations: 0,
 };
 
 function trackUpdate(chatId, hasText, textValue) {
@@ -286,8 +327,8 @@ async function showInternalMenu(chatId) {
       { text: "🇩🇪 DE", callback_data: "set_lang:de" },
     ],
     [
+      { text: "🎟️ Code invoeren", callback_data: "enter_code" },
       { text: "💎 Premium", url: PREMIUM_URL },
-      { text: "✨ lothis.com", url: "https://lothis.com" },
     ],
     [
       { text: "↩️ Reset", callback_data: "reset" },
@@ -322,6 +363,12 @@ async function handleCallback(update) {
     return;
   }
 
+  if (data === "enter_code") {
+    st.awaitingCode = true;
+    await tgSendMessage(chatId, "Stuur je activatiecode hier als normaal bericht.");
+    return;
+  }
+
   if (data.startsWith("set_lang:")) {
     st.lang = data.split(":")[1];
     st.prevId = null;
@@ -352,7 +399,9 @@ async function handleStats(chatId) {
       `Total updates: ${metrics.totalUpdates}`,
       `Total messages: ${metrics.totalMessages}`,
       `Starts: ${metrics.starts}`,
-      `Premium ids loaded: ${PREMIUM_CHAT_IDS.size}`,
+      `Premium ids loaded: ${activatedPremiumChatIds.size}`,
+      `Unused activation codes: ${ACTIVATION_CODES.size}`,
+      `Code activations: ${metrics.codeActivations}`,
     ].join("\n")
   );
 }
@@ -369,13 +418,19 @@ async function handleStart(chatId) {
     reply_markup: {
       inline_keyboard: premium
         ? [[{ text: "📌 Bekijk status", callback_data: "check_status" }]]
-        : [[{ text: "💎 Bekijk Premium", url: PREMIUM_URL }]],
+        : [
+            [
+              { text: "🎟️ Code invoeren", callback_data: "enter_code" },
+              { text: "💎 Bekijk Premium", url: PREMIUM_URL }
+            ]
+          ],
     },
   });
 }
 
 async function handlePremium(chatId) {
-  await tgSendMessage(chatId, premiumStatusText(chatId));
+  const st = getState(chatId);
+  await tgSendMessage(chatId, premiumStatusText(chatId, st.lang));
 }
 
 async function handleWhoAmI(chatId) {
@@ -383,6 +438,39 @@ async function handleWhoAmI(chatId) {
     chatId,
     `Jouw Telegram chat_id is:\n${chatId}\n\nGebruik dit later om premium te koppelen.`
   );
+}
+
+async function handleCodeCommand(chatId) {
+  const st = getState(chatId);
+  st.awaitingCode = true;
+  await tgSendMessage(chatId, "Stuur je activatiecode hier als normaal bericht.");
+}
+
+async function handleSubmittedCode(chatId, submittedText) {
+  const st = getState(chatId);
+  st.awaitingCode = false;
+
+  if (isPremium(chatId)) {
+    await tgSendMessage(chatId, "Je account staat al op Premium ✓");
+    return true;
+  }
+
+  const result = consumeActivationCode(submittedText);
+
+  if (!result.ok) {
+    await tgSendMessage(chatId, "Deze code klopt niet of is al gebruikt.");
+    return true;
+  }
+
+  activatePremium(chatId);
+  metrics.codeActivations += 1;
+
+  await tgSendMessage(
+    chatId,
+    "Gelukt ✨\nJe Premium is geactiveerd.\n\nTyp gewoon verder of gebruik /premium om je status te checken."
+  );
+
+  return true;
 }
 
 // =================== WEBHOOK ===================
@@ -406,6 +494,8 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     if (!chatId) return;
 
     trackUpdate(chatId, Boolean(text), text);
+
+    const st = getState(chatId);
 
     if (text === "/stats") {
       await handleStats(chatId);
@@ -438,8 +528,18 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
       return;
     }
 
+    if (text === "/code") {
+      await handleCodeCommand(chatId);
+      return;
+    }
+
     if (!text) {
       await tgSendMessage(chatId, "Stuur het even als tekst, dan pak ik ’m meteen.");
+      return;
+    }
+
+    if (st.awaitingCode) {
+      await handleSubmittedCode(chatId, text);
       return;
     }
 
@@ -485,7 +585,9 @@ app.get("/metrics", (req, res) => {
     totalUpdates: metrics.totalUpdates,
     totalMessages: metrics.totalMessages,
     starts: metrics.starts,
-    premiumIdsLoaded: PREMIUM_CHAT_IDS.size,
+    premiumIdsLoaded: activatedPremiumChatIds.size,
+    unusedActivationCodes: ACTIVATION_CODES.size,
+    codeActivations: metrics.codeActivations,
   });
 });
 
