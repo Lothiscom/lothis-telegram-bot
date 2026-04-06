@@ -319,6 +319,7 @@ function setLangConfirm(lang) {
 
 async function showInternalMenu(chatId) {
   const st = getState(chatId);
+  const premium = isPremium(chatId);
 
   const inlineKeyboard = [
     [
@@ -326,13 +327,17 @@ async function showInternalMenu(chatId) {
       { text: "🇬🇧 EN", callback_data: "set_lang:en" },
       { text: "🇩🇪 DE", callback_data: "set_lang:de" },
     ],
-    [
-      { text: "🎟️ Code invoeren", callback_data: "enter_code" },
-      { text: "💎 Premium", url: PREMIUM_URL },
-    ],
+    premium
+      ? [
+          { text: "📌 Status", callback_data: "check_status" },
+          { text: "✨ lothis.com", url: "https://lothis.com" },
+        ]
+      : [
+          { text: "🎟️ Code invoeren", callback_data: "enter_code" },
+          { text: "💎 Premium", url: PREMIUM_URL },
+        ],
     [
       { text: "↩️ Reset", callback_data: "reset" },
-      { text: "📌 Status", callback_data: "check_status" },
     ],
   ];
 
@@ -418,12 +423,10 @@ async function handleStart(chatId) {
     reply_markup: {
       inline_keyboard: premium
         ? [[{ text: "📌 Bekijk status", callback_data: "check_status" }]]
-        : [
-            [
-              { text: "🎟️ Code invoeren", callback_data: "enter_code" },
-              { text: "💎 Bekijk Premium", url: PREMIUM_URL }
-            ]
-          ],
+        : [[
+            { text: "🎟️ Code invoeren", callback_data: "enter_code" },
+            { text: "💎 Bekijk Premium", url: PREMIUM_URL }
+          ]],
     },
   });
 }
@@ -442,6 +445,12 @@ async function handleWhoAmI(chatId) {
 
 async function handleCodeCommand(chatId) {
   const st = getState(chatId);
+
+  if (isPremium(chatId)) {
+    await tgSendMessage(chatId, "Je account staat al op Premium ✓");
+    return;
+  }
+
   st.awaitingCode = true;
   await tgSendMessage(chatId, "Stuur je activatiecode hier als normaal bericht.");
 }
